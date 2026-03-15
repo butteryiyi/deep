@@ -1,7 +1,7 @@
 FROM python:3.10-slim
 
 # 安装系统依赖（Playwright Firefox 所需的全部运行时库）
-# 注意：Debian Bookworm 中部分包已改名，这里使用正确的包名
+# 基础镜像为 Debian Trixie (testing)，部分包名与 Bookworm 不同
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     curl \
@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libatk-bridge2.0-0 \
     libcups2 \
     libxkbcommon0 \
-    libasound2 \
+    libasound2t64 \
     libxss1 \
     libxtst6 \
     libxi6 \
@@ -34,15 +34,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfontconfig1 \
     libfreetype6 \
     libharfbuzz0b \
-    # Bookworm 中改名的包（替代 libgdk-pixbuf2.0-0, ttf-unifont, ttf-ubuntu-font-family）
     libgdk-pixbuf-2.0-0 \
+    # 字体（去掉 Trixie 中不存在的 fonts-ubuntu）
     fonts-unifont \
-    fonts-ubuntu \
     fonts-noto-color-emoji \
     fonts-liberation \
     fonts-ipafont-gothic \
     fonts-wqy-zenhei \
-    # 其他可能需要的
+    # 其他
     libdrm2 \
     libxshmfence1 \
     libglib2.0-0 \
@@ -59,7 +58,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
 # ===== 核心：预安装 Playwright Firefox（默认引擎）=====
-# 只运行 install 下载浏览器二进制，不运行 install-deps（依赖已在上面手动装好）
+# 只下载浏览器二进制，不用 install-deps（依赖已在上面手动装好）
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
 RUN python -m playwright install firefox \
     && chown -R app_user:app_user /opt/browsers
@@ -75,7 +74,6 @@ RUN python -c "import camoufox; camoufox.fetch()" 2>/dev/null \
 USER root
 COPY --chown=app_user:app_user . .
 
-# 设置默认环境变量（API_SECRET_KEY 建议通过 Secrets 覆盖，不要硬编码敏感值）
 ENV HEADLESS=true
 
 # 最终以 app_user 运行
