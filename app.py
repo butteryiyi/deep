@@ -1,3 +1,37 @@
+# app.py 最顶部，在所有 import 之前
+import importlib
+import types
+
+def _patch_camoufox_before_import():
+    """在 camoufox 被 import 之前，预先 patch 掉它的网络请求。"""
+    import urllib.request
+    _original_urlopen = urllib.request.urlopen
+
+    def _patched_urlopen(url, *args, **kwargs):
+        url_str = str(url if isinstance(url, str) else getattr(url, 'full_url', url))
+        if 'api.github.com' in url_str and 'camoufox' in url_str:
+            print(f"  🚫 拦截 GitHub API 请求: {url_str[:100]}")
+            raise urllib.error.URLError("Blocked: using local camoufox cache")
+        return _original_urlopen(url, *args, **kwargs)
+
+    urllib.request.urlopen = _patched_urlopen
+
+    # 同时 patch requests 库（如果 camoufox 用的是 requests）
+    try:
+        import requests
+        _original_get = requests.get
+
+        def _patched_get(url, *args, **kwargs):
+            if 'api.github.com' in str(url) and 'camoufox' in str(url):
+                print(f"  🚫 拦截 GitHub API 请求: {url[:100]}")
+                raise requests.exceptions.ConnectionError("Blocked: using local camoufox cache")
+            return _original_get(url, *args, **kwargs)
+
+        requests.get = _patched_get
+    except ImportError:
+        pass
+
+_patch_camoufox_before_import()
 """
 主服务器：FastAPI + WebSocket 代理
 外部请求通过 HTTP/WebSocket 进入，由内部浏览器在已认证的上下文中执行。
