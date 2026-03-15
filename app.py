@@ -1,40 +1,7 @@
-# app.py 最顶部，在所有 import 之前
-import importlib
-import types
-
-def _patch_camoufox_before_import():
-    """在 camoufox 被 import 之前，预先 patch 掉它的网络请求。"""
-    import urllib.request
-    _original_urlopen = urllib.request.urlopen
-
-    def _patched_urlopen(url, *args, **kwargs):
-        url_str = str(url if isinstance(url, str) else getattr(url, 'full_url', url))
-        if 'api.github.com' in url_str and 'camoufox' in url_str:
-            print(f"  🚫 拦截 GitHub API 请求: {url_str[:100]}")
-            raise urllib.error.URLError("Blocked: using local camoufox cache")
-        return _original_urlopen(url, *args, **kwargs)
-
-    urllib.request.urlopen = _patched_urlopen
-
-    # 同时 patch requests 库（如果 camoufox 用的是 requests）
-    try:
-        import requests
-        _original_get = requests.get
-
-        def _patched_get(url, *args, **kwargs):
-            if 'api.github.com' in str(url) and 'camoufox' in str(url):
-                print(f"  🚫 拦截 GitHub API 请求: {url[:100]}")
-                raise requests.exceptions.ConnectionError("Blocked: using local camoufox cache")
-            return _original_get(url, *args, **kwargs)
-
-        requests.get = _patched_get
-    except ImportError:
-        pass
-
-_patch_camoufox_before_import()
+# app.py
 """
 主服务器：FastAPI + WebSocket 代理
-外部请求通过 HTTP/WebSocket 进入，由内部浏览器在已认证的上下文中执行。
+修复：端口统一、生命周期管理、错误处理
 """
 
 import os
@@ -58,6 +25,7 @@ from keepalive import KeepaliveService
 # ============================================================
 browser_mgr: BrowserManager = None
 keepalive_svc: KeepaliveService = None
+_init_task = None
 
 # API 密钥验证
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
@@ -66,20 +34,15 @@ API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
 def verify_api_key(request: Request):
     """验证 API 密钥（如果设置了 API_SECRET_KEY 环境变量）"""
     if not API_SECRET_KEY:
-        return  # 未设置密钥则不验证
-
-    # 从 Authorization header 获取
+        return
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
         if token == API_SECRET_KEY:
             return
-
-    # 从 query parameter 获取
     token = request.query_params.get("token", "")
     if token == API_SECRET_KEY:
         return
-
     raise HTTPException(status_code=401, detail="Invalid API key")
 
 
@@ -89,7 +52,7 @@ def verify_api_key(request: Request):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动时先让服务器就绪，再在后台初始化浏览器。"""
-    global browser_mgr, keepalive_svc
+    global browser_mgr, keepalive_svc, _init_task
 
     print(f"\n{'='*60}")
     print(f"  应用启动 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -98,12 +61,20 @@ async def lifespan(app: FastAPI):
     browser_mgr = BrowserManager()
     keepalive_svc = KeepaliveService(browser_mgr)
 
-    asyncio.create_task(initialize_background())
+    # 后台初始化，不阻塞服务器启动
+    _init_task = asyncio.create_task(_safe_initialize())
 
     print("🚀 服务已就绪（浏览器后台初始化中），等待请求...\n")
     yield
 
+    # 关闭阶段
     print("\n⏹️  正在关闭服务...")
+    if _init_task and not _init_task.done():
+        _init_task.cancel()
+        try:
+            await _init_task
+        except asyncio.CancelledError:
+            pass
     if keepalive_svc:
         await keepalive_svc.stop()
     if browser_mgr:
@@ -111,16 +82,17 @@ async def lifespan(app: FastAPI):
     print("✅ 服务已安全关闭。")
 
 
-async def initialize_background():
-    """后台初始化浏览器，完成后启动心跳服务。"""
+async def _safe_initialize():
+    """带错误保护的后台初始化"""
     global browser_mgr, keepalive_svc
     print("⏳ 后台任务：开始初始化浏览器...")
     try:
-        await browser_mgr.initialize()
+        await asyncio.wait_for(browser_mgr.initialize(), timeout=120)
         print("✅ 后台任务：浏览器初始化完成。")
-
         if keepalive_svc and not keepalive_svc.is_running:
             await keepalive_svc.start()
+    except asyncio.TimeoutError:
+        print("❌ 后台任务：浏览器初始化超时（120秒）")
     except Exception as e:
         print(f"❌ 后台任务：浏览器初始化失败: {e}")
         import traceback
@@ -135,8 +107,6 @@ app = FastAPI(title="DeepSeek Proxy", lifespan=lifespan)
 # ============================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 async def index(request: Request):
-    """状态仪表盘页面。支持 GET 和 HEAD（Render 健康检查用 HEAD）。"""
-    # HEAD 请求直接返回 200，不需要 body
     if request.method == "HEAD":
         return Response(status_code=200)
 
@@ -145,6 +115,7 @@ async def index(request: Request):
     hours, remainder = divmod(int(uptime), 3600)
     minutes, seconds = divmod(remainder, 60)
 
+    browser_alive = status.get("browser_alive", False)
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -158,7 +129,7 @@ async def index(request: Request):
             h1 {{ color: #58a6ff; margin-top: 0; }}
             .status {{ display: flex; align-items: center; gap: 10px; margin: 20px 0; }}
             .dot {{ width: 12px; height: 12px; border-radius: 50%; 
-                    background: {"#3fb950" if status.get("browser_alive") else "#f85149"}; }}
+                    background: {"#3fb950" if browser_alive else "#f85149"}; }}
             .info {{ background: #21262d; padding: 15px; border-radius: 8px; margin: 10px 0; 
                      font-family: monospace; font-size: 14px; }}
             .label {{ color: #8b949e; }}
@@ -169,7 +140,7 @@ async def index(request: Request):
             <h1>🤖 DeepSeek Proxy</h1>
             <div class="status">
                 <div class="dot"></div>
-                <span>{"运行中" if status.get("browser_alive") else "离线"}</span>
+                <span>{"运行中" if browser_alive else "初始化中..."}</span>
             </div>
             <div class="info">
                 <div><span class="label">运行时间：</span>{hours}h {minutes}m {seconds}s</div>
@@ -191,7 +162,6 @@ async def index(request: Request):
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health(request: Request):
-    """健康检查端点：只要服务进程活着就返回200，不依赖浏览器状态。"""
     if request.method == "HEAD":
         return Response(status_code=200)
     return {"status": "ok"}
@@ -199,7 +169,6 @@ async def health(request: Request):
 
 @app.get("/status")
 async def status():
-    """详细状态端点。"""
     if browser_mgr:
         return await browser_mgr.get_status()
     return {"status": "initializing"}
@@ -207,7 +176,6 @@ async def status():
 
 @app.get("/screenshot")
 async def screenshot():
-    """获取当前浏览器截图（Base64），用于调试。"""
     if not browser_mgr:
         raise HTTPException(status_code=503, detail="浏览器未就绪")
     img_base64 = await browser_mgr.take_screenshot_base64()
@@ -227,11 +195,9 @@ async def screenshot():
 def build_prompt_from_messages(messages: list) -> str:
     prompt_parts = []
     prompt_parts.append("请根据以下对话历史和最后一个用户对话，生成对应的回复。")
-
     for message in messages:
         role = message.get("role", "")
         content = message.get("content", "")
-
         processed_content = ""
         if isinstance(content, str):
             processed_content = content
@@ -239,10 +205,8 @@ def build_prompt_from_messages(messages: list) -> str:
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     processed_content += part.get("text", "")
-
         if role and processed_content:
             prompt_parts.append(f"角色: {role}\n内容: {processed_content}")
-
     return "\n\n---\n\n".join(prompt_parts)
 
 
@@ -251,11 +215,10 @@ def build_prompt_from_messages(messages: list) -> str:
 # ============================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    # 验证 API 密钥
     verify_api_key(request)
 
     if not browser_mgr or not await browser_mgr.is_alive():
-        raise HTTPException(status_code=503, detail="浏览器会话未就绪")
+        raise HTTPException(status_code=503, detail="浏览器会话未就绪，请稍后重试")
 
     try:
         body = await request.json()
@@ -267,7 +230,6 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="messages 不能为空")
 
     stream = body.get("stream", False)
-
     user_prompt = build_prompt_from_messages(messages)
 
     if not user_prompt:
@@ -290,7 +252,6 @@ async def chat_completions(request: Request):
                     }]
                 }
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
             end_data = {
                 "id": f"chatcmpl-{int(time.time()*1000)}",
                 "object": "chat.completion.chunk",
@@ -304,7 +265,6 @@ async def chat_completions(request: Request):
             }
             yield f"data: {json.dumps(end_data, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
-
         return StreamingResponse(generate(), media_type="text/event-stream")
     else:
         response_text = await browser_mgr.send_message(user_prompt)
@@ -333,7 +293,6 @@ async def chat_completions(request: Request):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print(f"📡 WebSocket 客户端已连接: {websocket.client}")
-
     try:
         while True:
             data = await websocket.receive_text()
@@ -342,22 +301,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 message = payload.get("message", "")
             except json.JSONDecodeError:
                 message = data
-
             if not message:
                 await websocket.send_json({"error": "消息不能为空"})
                 continue
-
             if not browser_mgr or not await browser_mgr.is_alive():
                 await websocket.send_json({"error": "浏览器会话未就绪"})
                 continue
-
             await websocket.send_json({"type": "start"})
             full_response = ""
             async for chunk in browser_mgr.send_message_stream(message):
                 full_response += chunk
                 await websocket.send_json({"type": "chunk", "content": chunk})
             await websocket.send_json({"type": "end", "full_content": full_response})
-
     except WebSocketDisconnect:
         print(f"📡 WebSocket 客户端已断开: {websocket.client}")
     except Exception as e:
@@ -373,4 +328,5 @@ async def websocket_endpoint(websocket: WebSocket):
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 启动服务，监听端口: {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
