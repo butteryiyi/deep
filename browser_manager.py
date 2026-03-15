@@ -13,6 +13,18 @@ from typing import AsyncGenerator, Optional
 
 from auth_handler import AuthHandler
 
+# 审查替换的固定提示语列表，检测到这些就说明内容被替换了
+CENSORSHIP_PHRASES = [
+    "这个问题我暂时无法回答",
+    "让我们换个话题再聊聊吧",
+    "我无法回答这个问题",
+    "抱歉，我无法",
+    "这个话题不太适合讨论",
+    "我没法对此进行回答",
+    "作为AI助手，我无法",
+    "很抱歉，这个问题",
+]
+
 
 class ChatPage:
     def __init__(self, page, page_id: int):
@@ -92,10 +104,13 @@ class ChatPage:
         await textarea.press("Enter")
         await asyncio.sleep(1)
 
-    async def read_response_instant(self) -> str:
+    async def read_response_text(self) -> str:
         """
-        立刻读取最后一个对话项的 ds-markdown 文本。
-        不等待，不延迟，调用时立刻读。
+        精确读取正式回复区域的文本，排除思考区域。
+        策略：
+        1. 找到最后一个对话项
+        2. 排除思考折叠区域（通常有特定类名包裹）
+        3. 取正式回复的 ds-markdown 的 innerText（保留换行格式）
         """
         try:
             text = await self.page.evaluate("""
@@ -105,21 +120,69 @@ class ChatPage:
                     );
                     if (items.length === 0) return '';
                     const lastItem = items[items.length - 1];
-                    const mdEls = lastItem.querySelectorAll(
-                        '[class*="ds-markdown"]'
-                    );
-                    if (mdEls.length === 0) return '';
-                    return mdEls[mdEls.length - 1].textContent || '';
+
+                    // 尝试获取所有 ds-markdown 元素
+                    const allMd = lastItem.querySelectorAll('[class*="ds-markdown"]');
+                    if (allMd.length === 0) return '';
+
+                    // 策略：排除在思考区域内的 ds-markdown
+                    // 思考区域通常被一个带有特定类名的容器包裹
+                    // 常见的思考区域容器类名模式
+                    const thinkContainerSelectors = [
+                        '[class*="think"]',
+                        '[class*="Think"]',
+                        '[class*="thought"]',
+                        '[class*="reasoning"]',
+                        '[class*="_74c0879"]',
+                        '[class*="collapse"]',
+                        '[class*="Collapse"]',
+                        'details',
+                    ];
+
+                    // 找到思考区域的容器们
+                    const thinkContainers = [];
+                    for (const sel of thinkContainerSelectors) {
+                        const els = lastItem.querySelectorAll(sel);
+                        els.forEach(el => thinkContainers.push(el));
+                    }
+
+                    // 过滤：找到不在任何思考容器内部的 ds-markdown
+                    const replyMds = [];
+                    for (const md of allMd) {
+                        let insideThink = false;
+                        for (const tc of thinkContainers) {
+                            if (tc.contains(md) && tc !== md) {
+                                insideThink = true;
+                                break;
+                            }
+                        }
+                        if (!insideThink) {
+                            replyMds.push(md);
+                        }
+                    }
+
+                    // 如果过滤后没有结果，可能思考区域选择器没匹配上
+                    // 回退：取最后一个 ds-markdown（通常正式回复在思考之后）
+                    if (replyMds.length === 0) {
+                        // 回退策略：在 lastItem 的直接子层级找
+                        // 通常结构是: lastItem > [思考区域] > [正式回复区域(含ds-markdown)]
+                        // 取最后一个顶层 ds-markdown
+                        return allMd[allMd.length - 1].innerText || '';
+                    }
+
+                    // 取最后一个非思考区域的 ds-markdown
+                    // 用 innerText 而非 textContent，保留可读格式
+                    return replyMds[replyMds.length - 1].innerText || '';
                 }
             """)
             return (text or "").strip()
         except Exception:
             return ""
 
-    async def check_button_and_read(self) -> dict:
+    async def check_generation_state(self) -> dict:
         """
-        一次 evaluate 调用同时检查复制按钮 + 读取文本。
-        保证读到的文本和按钮状态是同一瞬间的。
+        检查生成状态：是否正在生成、是否有复制按钮、文本内容。
+        一次 evaluate 完成所有检查。
         """
         return await self.page.evaluate("""
             () => {
@@ -137,22 +200,56 @@ class ChatPage:
 
                 const lastItem = items[items.length - 1];
 
-                // 读文本
-                const mdEls = lastItem.querySelectorAll(
-                    '[class*="ds-markdown"]'
-                );
+                // ---- 读取正式回复文本（排除思考区域）----
+                const allMd = lastItem.querySelectorAll('[class*="ds-markdown"]');
                 let text = '';
-                if (mdEls.length > 0) {
-                    text = mdEls[mdEls.length - 1].textContent || '';
+
+                if (allMd.length > 0) {
+                    const thinkContainerSelectors = [
+                        '[class*="think"]',
+                        '[class*="Think"]',
+                        '[class*="thought"]',
+                        '[class*="reasoning"]',
+                        '[class*="_74c0879"]',
+                        '[class*="collapse"]',
+                        '[class*="Collapse"]',
+                        'details',
+                    ];
+
+                    const thinkContainers = [];
+                    for (const sel of thinkContainerSelectors) {
+                        const els = lastItem.querySelectorAll(sel);
+                        els.forEach(el => thinkContainers.push(el));
+                    }
+
+                    const replyMds = [];
+                    for (const md of allMd) {
+                        let insideThink = false;
+                        for (const tc of thinkContainers) {
+                            if (tc.contains(md) && tc !== md) {
+                                insideThink = true;
+                                break;
+                            }
+                        }
+                        if (!insideThink) {
+                            replyMds.push(md);
+                        }
+                    }
+
+                    if (replyMds.length > 0) {
+                        text = replyMds[replyMds.length - 1].innerText || '';
+                    } else {
+                        text = allMd[allMd.length - 1].innerText || '';
+                    }
                 }
 
-                // 复制按钮
+                // ---- 复制按钮 ----
                 const buttons = lastItem.querySelectorAll(
                     'div[role="button"]'
                 );
                 const hasButton = buttons.length > 0;
 
-                // 正在生成
+                // ---- 正在生成 ----
                 const stopBtn = document.querySelector(
                     '[class*="stop"], [class*="square"]'
                 );
@@ -176,6 +273,19 @@ class ChatPage:
             return True
         except Exception:
             return False
+
+
+def _is_censored(text: str) -> bool:
+    """检查文本是否是审查替换后的固定提示语"""
+    text = text.strip()
+    if not text:
+        return False
+    for phrase in CENSORSHIP_PHRASES:
+        if phrase in text:
+            # 如果整个文本很短且包含审查短语，很可能是被替换了
+            if len(text) < 100:
+                return True
+    return False
 
 
 class BrowserManager:
@@ -425,85 +535,163 @@ class BrowserManager:
             await cp.type_and_send(message)
             print(f"  [{req_id}] 等待回复...")
 
-            # ═══════════════════════════════════════════
-            # 核心逻辑：跟 Selenium 版一样
-            # 只等复制按钮出现，按钮出现的那一刻文本就在同一次
-            # evaluate 里一起读出来了，不给审查替换的时间窗口
-            # ═══════════════════════════════════════════
+            # ═══════════════════════════════════════════════════
+            # 核心逻辑重写：
+            # 1. 流式轮询，持续读取文本并输出增量
+            # 2. 每次都保存快照，检测到审查替换时使用上次快照
+            # 3. 复制按钮出现后立刻结束
+            # ═══════════════════════════════════════════════════
 
             max_wait_seconds = 600
-            captured_text = ""
+            poll_interval = 0.3  # 轮询间隔，越小越快能抢到内容
 
-            for tick in range(max_wait_seconds * 2):
-                await asyncio.sleep(0.5)
+            last_text = ""          # 上一次读到的完整文本
+            best_snapshot = ""      # 最佳快照（最长的有效文本）
+            yielded_length = 0      # 已经 yield 出去的字符数
+            generation_started = False
+            idle_ticks = 0          # 没有新增文本的连续次数
+            finished = False
+
+            for tick in range(int(max_wait_seconds / poll_interval)):
+                await asyncio.sleep(poll_interval)
 
                 try:
-                    # 关键：一次 evaluate 同时检查按钮 + 读文本
-                    # 按钮出现的瞬间文本一定是原始内容
-                    state = await cp.check_button_and_read()
+                    state = await cp.check_generation_state()
                 except Exception:
                     continue
 
                 has_button = state.get("hasButton", False)
                 is_generating = state.get("isGenerating", False)
-                text = (state.get("text") or "").strip()
+                current_text = (state.get("text") or "").strip()
                 item_count = state.get("itemCount", 0)
 
-                # 还在生成中，继续等
-                if is_generating:
-                    if tick > 0 and tick % 40 == 0:
-                        print(f"  [{req_id}] ⏳ 生成中... "
-                              f"len={len(text)} tick={tick}")
-                    continue
+                # 跟踪生成是否开始
+                if is_generating and not generation_started:
+                    generation_started = True
+                    print(f"  [{req_id}] 🚀 生成开始")
 
-                # 复制按钮出现了！立刻抢文本
-                if has_button and text:
-                    captured_text = text
-                    print(f"  [{req_id}] ✅ 复制按钮出现，"
-                          f"立刻捕获 {len(text)} 字符")
+                # ---- 审查检测 ----
+                # 如果之前积累了较长文本，突然变短且包含审查短语
+                if (current_text and
+                    len(best_snapshot) > 50 and
+                    len(current_text) < len(best_snapshot) * 0.5 and
+                    _is_censored(current_text)):
+                    print(f"  [{req_id}] 🛡️ 检测到审查替换！"
+                          f"当前={len(current_text)} vs 快照={len(best_snapshot)}")
+                    # 使用最佳快照，补发未 yield 的部分
+                    remaining = best_snapshot[yielded_length:]
+                    if remaining:
+                        yield remaining
+                    print(f"  [{req_id}] 📊 使用快照完成: "
+                          f"{len(best_snapshot)} 字符")
+                    finished = True
                     break
 
-                # 没有在生成，也没有按钮，但有文本
-                # 可能按钮还没渲染出来，再等几轮
-                if not is_generating and text and tick > 10:
-                    # 给按钮渲染 2 秒时间
-                    await asyncio.sleep(0.3)
-                    state2 = await cp.check_button_and_read()
-                    if state2.get("hasButton"):
-                        captured_text = (state2.get("text") or "").strip()
-                        print(f"  [{req_id}] ✅ 延迟捕获 "
-                              f"{len(captured_text)} 字符")
-                        break
+                # 如果当前文本就是审查提示语（从一开始就被替换了）
+                # 且没有积累过更长的文本
+                if (current_text and
+                    not is_generating and
+                    has_button and
+                    _is_censored(current_text) and
+                    len(best_snapshot) <= len(current_text)):
+                    # 没有更好的快照，只能返回审查后的文本
+                    # 但也先等一下看有没有机会
+                    pass
 
-                # 进度日志
-                if tick > 0 and tick % 20 == 0:
+                # ---- 更新快照 ----
+                if current_text and len(current_text) >= len(best_snapshot):
+                    best_snapshot = current_text
+
+                # ---- 流式输出增量 ----
+                if current_text and len(current_text) > yielded_length:
+                    # 只有在生成中才做流式输出，避免输出审查内容
+                    if is_generating or (not has_button and generation_started):
+                        new_content = current_text[yielded_length:]
+                        yield new_content
+                        yielded_length = len(current_text)
+                        last_text = current_text
+                        idle_ticks = 0
+
+                # ---- 完成检测 ----
+                if has_button and not is_generating and generation_started:
+                    # 复制按钮出现，生成结束
+                    # 先检查是否被审查替换
+                    if (_is_censored(current_text) and
+                        len(best_snapshot) > len(current_text) * 1.5):
+                        # 被替换了，用快照
+                        remaining = best_snapshot[yielded_length:]
+                        if remaining:
+                            yield remaining
+                        print(f"  [{req_id}] 🛡️ 完成时检测到审查，"
+                              f"使用快照 {len(best_snapshot)} 字符")
+                    else:
+                        # 正常完成，补发剩余
+                        if current_text and len(current_text) > yielded_length:
+                            remaining = current_text[yielded_length:]
+                            yield remaining
+                            yielded_length = len(current_text)
+                        print(f"  [{req_id}] ✅ 正常完成 "
+                              f"{max(yielded_length, len(current_text))} 字符")
+                    finished = True
+                    break
+
+                # ---- 文本不变计数 ----
+                if current_text == last_text:
+                    idle_ticks += 1
+                else:
+                    idle_ticks = 0
+                    last_text = current_text
+
+                # ---- 进度日志 ----
+                elapsed = tick * poll_interval
+                if tick > 0 and tick % int(20 / poll_interval) == 0:
                     print(
-                        f"  [{req_id}] ⏳ tick={tick} "
-                        f"len={len(text)} "
+                        f"  [{req_id}] ⏳ {elapsed:.0f}s "
+                        f"len={len(current_text)} "
                         f"gen={is_generating} "
                         f"btn={has_button} "
-                        f"items={item_count}"
+                        f"snapshot={len(best_snapshot)}"
                     )
 
-                # 超时
-                if tick > 120 and not text:
+                # ---- 超时检测 ----
+                if tick * poll_interval > 60 and not generation_started and not current_text:
                     print(f"  [{req_id}] ❌ 60秒无回复")
                     break
 
-            # 输出结果
-            if captured_text:
-                yield captured_text
-                print(f"  [{req_id}] 📊 页面#{cp.page_id} "
-                      f"完成: {len(captured_text)} 字符")
-            else:
-                # 最后一搏：直接读 DOM
-                fallback = await cp.read_response_instant()
-                if fallback:
-                    yield fallback
-                    print(f"  [{req_id}] 📋 兜底: {len(fallback)} 字符")
-                else:
-                    yield "抱歉，未能获取到响应。请稍后重试。"
-                    print(f"  [{req_id}] ❌ 完全无响应")
+                # 如果已经很久没有新内容且不在生成中
+                if (idle_ticks > int(30 / poll_interval) and
+                    not is_generating and
+                    generation_started):
+                    # 可能生成已结束但没检测到按钮
+                    if current_text:
+                        remaining = current_text[yielded_length:]
+                        if remaining:
+                            yield remaining
+                        print(f"  [{req_id}] ⏰ 超时完成 "
+                              f"{len(current_text)} 字符")
+                        finished = True
+                        break
+
+            # ---- 最终兜底 ----
+            if not finished:
+                if best_snapshot and yielded_length < len(best_snapshot):
+                    remaining = best_snapshot[yielded_length:]
+                    if remaining:
+                        yield remaining
+                    print(f"  [{req_id}] 📋 兜底快照: "
+                          f"{len(best_snapshot)} 字符")
+                elif yielded_length == 0:
+                    # 完全没输出过内容
+                    fallback = await cp.read_response_text()
+                    if fallback:
+                        yield fallback
+                        print(f"  [{req_id}] 📋 兜底读取: "
+                              f"{len(fallback)} 字符")
+                    else:
+                        yield "抱歉，未能获取到响应。请稍后重试。"
+                        print(f"  [{req_id}] ❌ 完全无响应")
+
+            print(f"  [{req_id}] 📊 页面#{cp.page_id} 请求完成")
 
         except Exception as e:
             print(f"  [{req_id}] ❌ {e}")
@@ -537,7 +725,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "multi-page-instant-capture",
+            "mode": "stream-with-anti-censorship",
             "has_token": True,
             "cookie_count": 0,
             "page_count": len(self._pages),
