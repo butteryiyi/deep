@@ -1,13 +1,13 @@
 FROM python:3.10-slim
 
-# 安装系统依赖（手动指定正确的包名，避免 playwright install --with-deps 的失败）
+# 安装系统依赖（只安装 Playwright 官方推荐的 Firefox 依赖）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     curl \
     gnupg \
     procps \
     xvfb \
-    # Firefox 运行时依赖（根据 playwright 官方文档）
+    # Firefox 运行时依赖（来自 Playwright 文档）
     libdbus-glib-1-2 \
     libgtk-3-0 \
     libx11-xcb1 \
@@ -26,9 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxi6 \
     libnss3 \
     libxcursor1 \
-    # 替代过时的字体包
-    fonts-unifont \
-    fonts-ubuntu \
+    # 额外可能需要的依赖
     libgdk-pixbuf-2.0-0 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
