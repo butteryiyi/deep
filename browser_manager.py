@@ -1,9 +1,9 @@
 # browser_manager.py
 """
-DeepSeek 反代管理器（纯 API 版）：
-- 用 Playwright 登录 + 拦截真实 API 请求
-- 提取准确的 Token / Cookie / API 路径
-- 之后全部走 HTTP，释放浏览器
+DeepSeek 反代（纯 API 版，无 UI 回退）
+- Playwright 登录拿 Token
+- 浏览器内 fetch 探测真实 API 路径
+- 全部走 HTTP，释放浏览器
 """
 
 import os
@@ -37,8 +37,8 @@ class BrowserManager:
         self._cookies: dict = {}
         self._token: str = ""
         self._api_base: str = ""
-        self._captured_headers: dict = {}
         self._http_client: Optional[httpx.AsyncClient] = None
+        self._extra_headers: dict = {}
 
     async def initialize(self):
         print("🔧 正在初始化...")
@@ -49,28 +49,34 @@ class BrowserManager:
 
         await self._login_with_browser()
 
-        if self.logged_in:
-            await self._sniff_real_api()
-            await self._extract_credentials()
+        if not self.logged_in:
+            raise RuntimeError("❌ 登录失败，无法继续。")
 
-            if self._token and self._api_base:
-                await self._close_browser()
-                self._http_client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(300.0, connect=10.0),
-                    headers=self._build_headers(),
-                    cookies=self._cookies,
-                )
-                ok = await self._verify_api()
-                if ok:
-                    print("🎉 API 验证通过！纯 HTTP 模式已就绪。")
-                else:
-                    print("⚠️ API 验证失败，回退到浏览器模式。")
-                    await self._fallback_to_browser()
-            else:
-                print("⚠️ 未能提取 API 信息，保持浏览器模式。")
-                self._http_client = None
+        # 在浏览器同源环境下探测 API
+        await self._probe_api_in_browser()
+        # 提取凭据
+        await self._extract_credentials()
+
+        if not self._token:
+            raise RuntimeError("❌ 无法提取 Token，无法继续。")
+        if not self._api_base:
+            raise RuntimeError("❌ 无法确定 API 路径，无法继续。")
+
+        # 关闭浏览器
+        await self._close_browser()
+
+        # 创建 HTTP 客户端
+        self._http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=10.0),
+            headers=self._build_headers(),
+            cookies=self._cookies,
+        )
+
+        ok = await self._verify_api()
+        if ok:
+            print("🎉 API 验证通过，纯 HTTP 模式已就绪。")
         else:
-            print("⚠️ 登录未完成。")
+            raise RuntimeError("❌ API 验证失败。请检查日志。")
 
     async def _login_with_browser(self):
         print("  → 启动浏览器进行登录...")
@@ -109,155 +115,272 @@ class BrowserManager:
         auth = AuthHandler(self.page, context=self.context)
         self.logged_in = await auth.login(self.email, self.password)
 
-    async def _sniff_real_api(self):
+    async def _probe_api_in_browser(self):
         """
-        在浏览器里发一条测试消息，拦截所有网络请求，
-        找到真实的 API 端点和请求头
+        在浏览器里用 fetch 探测真实 API 路径。
+        因为浏览器已经登录，fetch 自动带 Cookie，不会有 CORS 问题。
         """
-        print("  → 嗅探真实 API 端点...")
+        print("  → 在浏览器内探测 API 路径...")
 
-        captured_requests = []
+        result = await self.page.evaluate("""
+            async () => {
+                const results = {};
+                
+                // 候选 API base 路径
+                const bases = [
+                    '/api/v0',
+                    '/api/v1', 
+                    '/api',
+                    '/v0',
+                    '/v1',
+                ];
+                
+                // 候选端点（GET 类）
+                const getEndpoints = [
+                    '/chat/list_session?count=1&offset=0',
+                    '/chat/session/list?count=1&offset=0',
+                    '/session/list?count=1&offset=0',
+                    '/user/info',
+                    '/user/current',
+                    '/chat/history',
+                ];
+                
+                // 候选端点（POST 类）
+                const postEndpoints = [
+                    {path: '/chat/create_session', body: {agent: 'chat'}},
+                    {path: '/chat/session/create', body: {agent: 'chat'}},
+                ];
+                
+                // 先尝试 GET
+                for (const base of bases) {
+                    for (const ep of getEndpoints) {
+                        const url = base + ep;
+                        try {
+                            const resp = await fetch(url, {
+                                method: 'GET',
+                                credentials: 'include',
+                            });
+                            const status = resp.status;
+                            let body = '';
+                            try { body = await resp.text(); } catch(e) {}
+                            
+                            results[`GET ${url}`] = {status, body: body.substring(0, 300)};
+                            
+                            if (status === 200) {
+                                return {
+                                    success: true, 
+                                    api_base: base, 
+                                    method: 'GET',
+                                    endpoint: url, 
+                                    status, 
+                                    body: body.substring(0, 500),
+                                    all: results
+                                };
+                            }
+                        } catch(e) {
+                            results[`GET ${url}`] = {error: e.message};
+                        }
+                    }
+                }
+                
+                // 再尝试 POST
+                for (const base of bases) {
+                    for (const ep of postEndpoints) {
+                        const url = base + ep.path;
+                        try {
+                            const resp = await fetch(url, {
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify(ep.body),
+                            });
+                            const status = resp.status;
+                            let body = '';
+                            try { body = await resp.text(); } catch(e) {}
+                            
+                            results[`POST ${url}`] = {status, body: body.substring(0, 300)};
+                            
+                            if (status === 200) {
+                                return {
+                                    success: true, 
+                                    api_base: base, 
+                                    method: 'POST',
+                                    endpoint: url, 
+                                    status, 
+                                    body: body.substring(0, 500),
+                                    all: results
+                                };
+                            }
+                        } catch(e) {
+                            results[`POST ${url}`] = {error: e.message};
+                        }
+                    }
+                }
+                
+                return {success: false, all: results};
+            }
+        """)
 
-        async def on_request(request):
+        print(f"  → 探测结果:")
+        if result.get("success"):
+            self._api_base = f"https://chat.deepseek.com{result['api_base']}"
+            print(f"  ✅ 找到有效 API base: {self._api_base}")
+            print(f"     命中: {result['method']} {result['endpoint']} → {result['status']}")
+            print(f"     响应: {result['body'][:200]}")
+        else:
+            # 打印所有尝试结果用于调试
+            all_results = result.get("all", {})
+            for url_key, res in all_results.items():
+                status = res.get("status", "ERR")
+                body = res.get("body", res.get("error", ""))[:100]
+                print(f"    {url_key}: {status} → {body}")
+
+            # 最后一招：拦截页面上按钮触发的请求
+            print("  → 所有常规路径都失败，尝试拦截页面真实请求...")
+            await self._sniff_by_interaction()
+
+    async def _sniff_by_interaction(self):
+        """在页面上触发操作，拦截实际发出的 API 请求"""
+        captured = []
+
+        async def capture(request):
             url = request.url
-            if "chat.deepseek.com" in url and "/api/" in url:
-                captured_requests.append({
+            if "deepseek.com" in url and request.resource_type in ("fetch", "xhr"):
+                captured.append({
                     "url": url,
                     "method": request.method,
                     "headers": dict(request.headers),
-                    "post_data": request.post_data,
                 })
 
-        self.page.on("request", on_request)
+        self.page.on("request", capture)
 
-        # 等几秒让页面自然发一些 API 请求（加载会话列表等）
-        await asyncio.sleep(3)
+        # 尝试点击新对话按钮或任何能触发 API 的操作
+        try:
+            # 等一下让页面自然加载触发请求
+            await asyncio.sleep(3)
 
-        # 打印所有捕获的请求
-        print(f"  → 捕获到 {len(captured_requests)} 个 API 请求:")
-        for req in captured_requests:
+            # 尝试点击侧边栏之类的
+            try:
+                btn = self.page.locator("xpath=//*[contains(text(), '开启新对话')]").first
+                if await btn.is_visible(timeout=3000):
+                    await btn.click()
+                    await asyncio.sleep(2)
+            except Exception:
+                pass
+
+            # 再等等
+            await asyncio.sleep(2)
+        finally:
+            self.page.remove_listener("request", capture)
+
+        print(f"  → 拦截到 {len(captured)} 个请求:")
+        for req in captured:
             print(f"    {req['method']} {req['url']}")
-            # 提取 Authorization header
-            if "authorization" in req["headers"]:
-                auth_header = req["headers"]["authorization"]
-                print(f"    Authorization: {auth_header[:50]}...")
+            auth_h = req["headers"].get("authorization", "")
+            if auth_h:
+                print(f"      Auth: {auth_h[:60]}...")
+                if auth_h.startswith("Bearer ") and not self._token:
+                    self._token = auth_h[7:]
 
-        # 分析捕获结果，提取 API base 和 headers
-        for req in captured_requests:
-            url = req["url"]
-            # 找到 API base（例如 /api/v0/ 或 /api/v1/ 等）
-            if "/api/" in url:
-                # 提取 base: https://chat.deepseek.com/api/v0
+            # 提取 API base
+            if "/api/" in req["url"] and not self._api_base:
                 import re
-                match = re.search(r"(https://chat\.deepseek\.com/api/v\d+)", url)
-                if match and not self._api_base:
-                    self._api_base = match.group(1)
-                    print(f"  ✅ 发现 API base: {self._api_base}")
+                m = re.search(r"(https://[^/]+/api/v\d+)", req["url"])
+                if m:
+                    self._api_base = m.group(1)
+                    print(f"  ✅ 从拦截请求中提取到 API base: {self._api_base}")
+                else:
+                    m2 = re.search(r"(https://[^/]+/api)", req["url"])
+                    if m2:
+                        self._api_base = m2.group(1)
+                        print(f"  ✅ 从拦截请求中提取到 API base: {self._api_base}")
 
-                # 提取真实的 Authorization
-                if "authorization" in req["headers"] and not self._token:
-                    auth_val = req["headers"]["authorization"]
-                    if auth_val.startswith("Bearer "):
-                        self._token = auth_val[7:]
-                        print(f"  ✅ 从请求头提取到 Token: {self._token[:30]}...")
-
-                # 保存完整的请求头作为参考
-                if not self._captured_headers:
-                    self._captured_headers = {
-                        k: v for k, v in req["headers"].items()
-                        if k.lower() not in ("host", "content-length")
-                    }
-
-        self.page.remove_listener("request", on_request)
-
-        if not self._api_base:
-            print("  ⚠️ 未捕获到 API base，尝试常见路径...")
-            # 手动尝试几个可能的路径
-            for base in [
-                "https://chat.deepseek.com/api/v0",
-                "https://chat.deepseek.com/api/v1",
-                "https://chat.deepseek.com/api",
-            ]:
-                self._api_base = base
-                print(f"    尝试: {base}")
+            # 提取额外 headers
+            for key in ["x-app-version", "x-client-locale", "x-client-platform",
+                         "x-client-version", "x-ds-pow-response", "x-request-id"]:
+                if key in req["headers"] and key not in self._extra_headers:
+                    self._extra_headers[key] = req["headers"][key]
 
     async def _extract_credentials(self):
-        """从浏览器中提取正确格式的 Token"""
         print("  → 提取登录凭据...")
 
-        # 提取 cookies
+        # Cookies
         raw_cookies = await self.context.cookies()
         for c in raw_cookies:
             self._cookies[c["name"]] = c["value"]
         print(f"  ✅ 提取到 {len(self._cookies)} 个 Cookie")
 
-        # 如果嗅探阶段已经拿到 token，就不用再提取了
+        # 如果嗅探已经拿到 token 就跳过
         if self._token:
-            print(f"  ✅ Token 已通过请求嗅探获得")
+            print(f"  ✅ Token 已通过请求拦截获得: {self._token[:30]}...")
             return
 
-        # 从 localStorage 提取 token（需要正确解析 JSON 包装）
+        # 从 localStorage 正确解析 token
         try:
             token = await self.page.evaluate("""
                 () => {
-                    // 方法1: 直接找常见 key
-                    const keys = ['userToken', 'ds_token', 'token', '_token', 'auth_token'];
-                    for (const key of keys) {
-                        const raw = localStorage.getItem(key);
-                        if (!raw) continue;
-                        
-                        // 可能是 JSON 包装: {"value":"xxx"} 或纯字符串
+                    function extractValue(raw) {
+                        if (!raw) return null;
                         try {
                             const parsed = JSON.parse(raw);
-                            if (parsed && parsed.value) {
-                                // value 本身可能也是 JSON 字符串
-                                if (typeof parsed.value === 'string') {
-                                    return parsed.value;
-                                }
+                            if (parsed && typeof parsed.value === 'string') {
+                                return parsed.value;
                             }
                             if (typeof parsed === 'string') {
                                 return parsed;
                             }
-                        } catch(e) {
-                            // 不是 JSON，就是纯 token
-                            return raw;
-                        }
-                    }
-                    
-                    // 方法2: 扫描所有 localStorage，找 JWT 样式的值
-                    for (let i = 0; i < localStorage.length; i++) {
-                        const key = localStorage.key(i);
-                        const raw = localStorage.getItem(key);
-                        if (!raw) continue;
-                        
-                        let val = raw;
-                        try {
-                            const p = JSON.parse(raw);
-                            if (p && p.value && typeof p.value === 'string') val = p.value;
                         } catch(e) {}
-                        
-                        // JWT 或长 token 特征
-                        if (val.length > 40 && !val.startsWith('{') && !val.startsWith('[')) {
-                            console.log('Found potential token in key:', key);
-                            return val;
+                        return raw;
+                    }
+                    
+                    // 按优先级查找
+                    const keys = ['userToken', 'ds_token', 'token', '_token', 'auth_token'];
+                    for (const key of keys) {
+                        const raw = localStorage.getItem(key);
+                        if (raw) {
+                            const val = extractValue(raw);
+                            if (val && val.length > 20) return val;
                         }
                     }
                     
-                    return null;
+                    // 列出所有 localStorage keys 用于调试
+                    const allKeys = [];
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        const v = localStorage.getItem(k);
+                        allKeys.push({key: k, preview: (v||'').substring(0, 80)});
+                    }
+                    return JSON.stringify({_debug_all_keys: allKeys});
                 }
             """)
-            if token:
+
+            if token and not token.startswith('{"_debug'):
                 self._token = token.strip()
                 print(f"  ✅ 从 localStorage 提取到 Token: {self._token[:30]}...")
             else:
-                print("  ⚠️ localStorage 中未找到 Token")
+                # 打印调试信息
+                print(f"  ⚠️ localStorage 调试信息:")
+                try:
+                    debug = json.loads(token)
+                    for item in debug.get("_debug_all_keys", []):
+                        print(f"    {item['key']}: {item['preview']}")
+                except Exception:
+                    print(f"    {token[:300]}")
         except Exception as e:
             print(f"  ⚠️ Token 提取异常: {e}")
+
+        # 从 cookies 找 token
+        if not self._token:
+            for name in ["ds_token", "token", "sessionToken", "ds_session_id"]:
+                if name in self._cookies:
+                    self._token = self._cookies[name]
+                    print(f"  ✅ 使用 Cookie '{name}' 作为 Token: {self._token[:30]}...")
+                    break
 
     def _build_headers(self) -> dict:
         headers = {
             "Accept": "text/event-stream",
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language": "zh-CN,zh;q=0.9",
             "Content-Type": "application/json",
             "Origin": "https://chat.deepseek.com",
             "Referer": "https://chat.deepseek.com/",
@@ -269,71 +392,43 @@ class BrowserManager:
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
 
-        # 合并嗅探到的真实请求头（优先级更高）
-        if self._captured_headers:
-            for key in ["x-app-version", "x-client-locale", "x-client-platform",
-                        "x-client-version", "x-ds-pow-response"]:
-                if key in self._captured_headers:
-                    headers[key] = self._captured_headers[key]
-
+        # 合并拦截到的真实请求头
+        headers.update(self._extra_headers)
         return headers
 
     async def _verify_api(self) -> bool:
-        try:
-            # 尝试多个可能的端点
-            endpoints = [
-                f"{self._api_base}/chat/list_session",
-                f"{self._api_base}/chat/session/list",
-                f"{self._api_base}/session/list",
-            ]
-            for endpoint in endpoints:
-                try:
-                    resp = await self._http_client.get(
-                        endpoint,
-                        params={"count": 1, "offset": 0},
-                    )
-                    print(f"  → 尝试 {endpoint}: {resp.status_code}")
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        print(f"    响应: {json.dumps(data, ensure_ascii=False)[:200]}")
-                        if data.get("code") == 0 or "data" in data:
-                            self._api_base = endpoint.rsplit("/", 2)[0]
-                            return True
-                    elif resp.status_code != 404:
-                        print(f"    响应体: {resp.text[:200]}")
-                except Exception as e:
-                    print(f"    异常: {e}")
+        """验证 API 是否可用"""
+        # 用探测到的 base 尝试一个简单请求
+        endpoints_to_try = []
+        if self._api_base:
+            endpoints_to_try.append(f"{self._api_base}/chat/create_session")
 
-            # 如果都 404，试试 POST
-            for endpoint in [
-                f"{self._api_base}/chat/create_session",
-            ]:
-                try:
-                    resp = await self._http_client.post(
-                        endpoint,
-                        json={"agent": "chat"},
-                    )
-                    print(f"  → 尝试 POST {endpoint}: {resp.status_code}")
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        print(f"    响应: {json.dumps(data, ensure_ascii=False)[:200]}")
-                        return True
-                    else:
-                        print(f"    响应体: {resp.text[:200]}")
-                except Exception as e:
-                    print(f"    异常: {e}")
+        for endpoint in endpoints_to_try:
+            try:
+                resp = await self._http_client.post(
+                    endpoint, json={"agent": "chat"}
+                )
+                print(f"  → 验证 POST {endpoint}: {resp.status_code}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    print(f"    响应: {json.dumps(data, ensure_ascii=False)[:200]}")
+                    # 如果创建成功，删掉测试会话
+                    try:
+                        sid = data.get("data", {}).get("biz_data", {}).get("id")
+                        if sid:
+                            await self._http_client.post(
+                                f"{self._api_base}/chat/delete_session",
+                                json={"chat_session_id": sid}
+                            )
+                    except Exception:
+                        pass
+                    return data.get("code") == 0
+                else:
+                    print(f"    响应: {resp.text[:200]}")
+            except Exception as e:
+                print(f"    异常: {e}")
 
-            return False
-        except Exception as e:
-            print(f"  → API 验证异常: {e}")
-            return False
-
-    async def _fallback_to_browser(self):
-        """API 模式失败，保持浏览器运行，用 UI 操作"""
-        print("  ⚠️ 回退到浏览器 UI 模式...")
-        # 重新启动浏览器（之前可能已关闭）
-        if not self.browser or not self.browser.is_connected():
-            await self._login_with_browser()
+        return False
 
     async def _close_browser(self):
         try:
@@ -351,25 +446,37 @@ class BrowserManager:
         except Exception as e:
             print(f"  ⚠️ 关闭浏览器出错: {e}")
 
+    # ─── 对外接口 ───────────────────────────────────────
+
     async def is_alive(self) -> bool:
-        if self._http_client:
-            try:
-                return await self._verify_api()
-            except Exception:
-                return False
-        elif self.page and not self.page.is_closed():
-            try:
-                await self.page.evaluate("() => document.title")
-                return True
-            except Exception:
-                return False
-        return False
+        if not self._http_client:
+            return False
+        try:
+            resp = await self._http_client.post(
+                f"{self._api_base}/chat/create_session",
+                json={"agent": "chat"}
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                try:
+                    sid = data.get("data", {}).get("biz_data", {}).get("id")
+                    if sid:
+                        await self._http_client.post(
+                            f"{self._api_base}/chat/delete_session",
+                            json={"chat_session_id": sid}
+                        )
+                except Exception:
+                    pass
+                return data.get("code") == 0
+            return False
+        except Exception:
+            return False
 
     async def get_status(self) -> dict:
         return {
             "logged_in": self.logged_in,
-            "mode": "http-api" if self._http_client else "browser-ui",
-            "api_base": self._api_base or "N/A",
+            "mode": "http-api",
+            "api_base": self._api_base,
             "has_token": bool(self._token),
             "cookie_count": len(self._cookies),
             "uptime_seconds": time.time() - self.start_time,
@@ -378,13 +485,7 @@ class BrowserManager:
         }
 
     async def take_screenshot_base64(self) -> Optional[str]:
-        if self.page and not self.page.is_closed():
-            try:
-                data = await self.page.screenshot(full_page=False)
-                return base64.b64encode(data).decode("utf-8")
-            except Exception:
-                pass
-        return None
+        return None  # 纯 API 模式无截图
 
     async def send_message(self, message: str) -> str:
         full = ""
@@ -397,17 +498,10 @@ class BrowserManager:
         req_id = self.total_requests
         print(f"📨 请求 #{req_id} (长度: {len(message)} 字符)")
 
-        if self._http_client:
-            async for chunk in self._send_via_api(message, req_id):
-                yield chunk
-        elif self.page and not self.page.is_closed():
-            async for chunk in self._send_via_browser(message, req_id):
-                yield chunk
-        else:
-            yield "[错误] 无可用的发送通道"
+        if not self._http_client:
+            yield "[错误] HTTP 客户端未初始化"
+            return
 
-    async def _send_via_api(self, message: str, req_id: int) -> AsyncGenerator[str, None]:
-        """通过 HTTP API 发送"""
         try:
             # 创建会话
             create_resp = await self._http_client.post(
@@ -420,7 +514,7 @@ class BrowserManager:
 
             session_data = create_resp.json()
             if session_data.get("code") != 0:
-                yield f"[错误] 创建会话异常: {json.dumps(session_data, ensure_ascii=False)[:200]}"
+                yield f"[错误] {json.dumps(session_data, ensure_ascii=False)[:200]}"
                 return
 
             chat_session_id = session_data["data"]["biz_data"]["id"]
@@ -454,7 +548,6 @@ class BrowserManager:
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
-
                     choices = data.get("choices", [])
                     if choices:
                         content = choices[0].get("delta", {}).get("content", "")
@@ -462,7 +555,7 @@ class BrowserManager:
                             full_text += content
                             yield content
 
-            # 清理
+            # 清理会话
             try:
                 await self._http_client.post(
                     f"{self._api_base}/chat/delete_session",
@@ -473,82 +566,22 @@ class BrowserManager:
 
             print(f"  [{req_id}] ✅ 完成，长度: {len(full_text)}")
 
+        except httpx.ReadTimeout:
+            yield "[错误] 响应超时"
         except Exception as e:
             print(f"  [{req_id}] ❌ {e}")
             import traceback
             traceback.print_exc()
             yield f"[错误] {str(e)}"
 
-    async def _send_via_browser(self, message: str, req_id: int) -> AsyncGenerator[str, None]:
-        """浏览器 UI 模式回退（保留原有逻辑的精简版）"""
-        try:
-            if "chat.deepseek.com" not in self.page.url:
-                await self.page.goto("https://chat.deepseek.com/", wait_until="networkidle", timeout=30000)
-                await asyncio.sleep(2)
-
-            # 新对话
-            try:
-                btn = self.page.locator("xpath=//*[contains(text(), '开启新对话')]").first
-                await btn.wait_for(state="visible", timeout=5000)
-                await btn.click()
-                await asyncio.sleep(1)
-            except Exception:
-                pass
-
-            textarea = self.page.locator("textarea").first
-            await textarea.wait_for(state="visible", timeout=10000)
-            await textarea.click()
-            await textarea.fill(message)
-            await asyncio.sleep(0.3)
-            await textarea.press("Enter")
-            await asyncio.sleep(2)
-
-            last_text = ""
-            stable = 0
-            for _ in range(1200):
-                await asyncio.sleep(0.5)
-                result = await self.page.evaluate("""
-                    () => {
-                        const items = document.querySelectorAll('div[data-virtual-list-item-key]');
-                        if (!items.length) return {text:'',done:false};
-                        const last = items[items.length-1];
-                        const md = last.querySelectorAll('[class*="ds-markdown"]');
-                        const text = md.length ? md[md.length-1].textContent||'' : '';
-                        const btns = last.querySelectorAll('div[role="button"]');
-                        const stop = document.querySelector('[class*="stop"],[class*="square"]');
-                        return {text, done: btns.length>0 && !stop};
-                    }
-                """)
-                cur = result.get("text", "").strip()
-                if cur and len(cur) > len(last_text):
-                    yield cur[len(last_text):]
-                    last_text = cur
-                    stable = 0
-                elif cur == last_text:
-                    stable += 1
-                if result.get("done") and stable >= 3:
-                    break
-                if stable >= 60:
-                    break
-
-            if not last_text:
-                yield "抱歉，未能获取到响应。"
-
-            print(f"  [{req_id}] ✅ 浏览器模式完成，长度: {len(last_text)}")
-        except Exception as e:
-            yield f"[错误] {str(e)}"
-
     async def simulate_activity(self):
         self.heartbeat_count += 1
-        if self.heartbeat_count % 50 == 0:
-            if self._http_client:
-                print(f"💓 心跳 #{self.heartbeat_count} - HTTP 模式运行中")
+        # 纯 API 模式不需要频繁心跳
 
     async def shutdown(self):
         try:
             if self._http_client:
                 await self._http_client.aclose()
-            await self._close_browser()
             print("🔒 已安全关闭。")
         except Exception as e:
             print(f"⚠️ 关闭出错: {e}")
