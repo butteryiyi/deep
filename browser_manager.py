@@ -1,17 +1,18 @@
 # browser_manager.py
 """
-DeepSeek 反代（浏览器驻留模式）
-- Playwright 登录后保留浏览器
-- 所有 API 请求都在浏览器内通过 page.evaluate(fetch) 执行
-- 自动处理 Cookie、PoW 等反爬机制
+DeepSeek 反代（DOM 交互模式）
+- 合并旧版（DOM 交互 + Camoufox + 请求锁）与新版（就绪控制 + 辅助脚本预注入）
+- 不涉及 PoW，所有反爬由浏览器自己处理
 """
 
 import os
 import sys
-import json
 import time
+import json
 import asyncio
-import hashlib
+import base64
+import shutil
+from pathlib import Path
 from datetime import datetime
 from typing import AsyncGenerator, Optional
 
@@ -27,24 +28,24 @@ class BrowserManager:
         self.logged_in = False
         self.start_time = time.time()
         self.heartbeat_count = 0
+        self.requests_handled = 0
         self.total_requests = 0
 
         self.email = os.getenv("DEEPSEEK_EMAIL", "")
         self.password = os.getenv("DEEPSEEK_PASSWORD", "")
         self.headless = os.getenv("HEADLESS", "true").lower() == "true"
+        self._engine = "unknown"
 
-        self._cookies: dict = {}
-        self._token: str = ""
-        self._api_base: str = "https://chat.deepseek.com/api/v0"
-        self._extra_headers: dict = {}
+        # 请求锁：保证同时只有一个对话在进行
+        self._lock = asyncio.Lock()
 
-        # ── 就绪控制 ──
+        # 就绪控制
         self._ready = False
         self._ready_event = asyncio.Event()
 
-    # ── 公开方法：等待就绪 ──
+    # ── 就绪控制 ──
+
     async def wait_until_ready(self, timeout: float = 180.0) -> bool:
-        """阻塞等待浏览器初始化完成，返回是否就绪"""
         try:
             await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
             return True
@@ -55,36 +56,118 @@ class BrowserManager:
     def is_ready(self) -> bool:
         return self._ready
 
+    # ── Camoufox 缓存管理 ──
+
+    def _prepare_camoufox_cache(self):
+        home_cache = Path.home() / ".cache"
+        store_dir = home_cache / "camoufox_store"
+        cache_dir = home_cache / "camoufox"
+
+        if store_dir.exists() and any(store_dir.iterdir()):
+            print(f"  📦 从持久存储恢复 Camoufox 缓存...")
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(store_dir, cache_dir, dirs_exist_ok=True)
+                print(f"  ✅ 缓存已恢复，大小: {self._dir_size(cache_dir):.0f} MB")
+            except Exception as e:
+                print(f"  ⚠️ 恢复缓存失败: {e}")
+        else:
+            print(f"  📦 未找到持久缓存，Camoufox 将首次下载...")
+            store_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_camoufox_cache(self):
+        home_cache = Path.home() / ".cache"
+        store_dir = home_cache / "camoufox_store"
+        cache_dir = home_cache / "camoufox"
+
+        if cache_dir.exists() and any(cache_dir.iterdir()):
+            try:
+                store_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(cache_dir, store_dir, dirs_exist_ok=True)
+                print(f"  💾 Camoufox 缓存已保存 ({self._dir_size(store_dir):.0f} MB)")
+            except Exception as e:
+                print(f"  ⚠️ 保存缓存失败（非致命）: {e}")
+
+    @staticmethod
+    def _dir_size(path: Path) -> float:
+        total = 0
+        try:
+            for f in path.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+        except Exception:
+            pass
+        return total / (1024 * 1024)
+
+    # ── 初始化 ──
+
     async def initialize(self):
-        print("🔧 正在初始化...")
+        print("🔧 正在初始化浏览器...")
 
         if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
             if os.path.isdir("/opt/browsers"):
                 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/browsers"
 
-        await self._login_with_browser()
+        # 优先尝试 Camoufox，失败则回退 Playwright Firefox
+        camoufox_ok = False
+        try:
+            os.environ['CAMOUFOX_NO_UPDATE_CHECK'] = '1'
+            self._prepare_camoufox_cache()
+            from camoufox.async_api import AsyncCamoufox
+            self._camoufox_cls = AsyncCamoufox
+            await self._start_with_camoufox()
+            camoufox_ok = True
+            self._engine = "camoufox"
+            self._save_camoufox_cache()
+        except Exception as e:
+            print(f"⚠️ Camoufox 启动失败: {e}")
+            print("⚠️ 回退到 Playwright Firefox...")
+            if hasattr(self, '_camoufox'):
+                try:
+                    await self._camoufox.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            camoufox_ok = False
+
+        if not camoufox_ok:
+            await self._start_with_playwright()
+            self._engine = "playwright-firefox"
+
+        await self._inject_stealth_scripts()
+
+        # 登录
+        auth = AuthHandler(self.page, context=self.context)
+        self.logged_in = await auth.login(self.email, self.password)
 
         if not self.logged_in:
-            raise RuntimeError("❌ 登录失败。")
-
-        await self._capture_real_api()
-        await self._extract_credentials()
-
-        if not self._token:
-            raise RuntimeError("❌ 无法提取 Token。")
-
-        ok = await self._verify_api()
-        if ok:
-            print("🎉 API 验证通过，浏览器驻留模式就绪。")
+            print("⚠️ 登录可能未完成，请检查 /screenshot 端点。")
         else:
-            print("⚠️ API 验证未通过，但仍继续运行。")
+            print("🎉 登录成功！")
 
-        # ── 标记就绪，唤醒所有等待者 ──
+        # 注入 DOM 辅助脚本
+        await self._inject_helper_scripts()
+
+        # 标记就绪
         self._ready = True
         self._ready_event.set()
+        print(f"✅ 浏览器就绪（引擎: {self._engine}，模式: DOM 交互，无 PoW）")
 
-    async def _login_with_browser(self):
-        print("  → 启动浏览器进行登录...")
+    async def _start_with_camoufox(self):
+        print("  → 使用 Camoufox 反指纹浏览器...")
+        from camoufox.async_api import AsyncCamoufox
+
+        self._camoufox = AsyncCamoufox(headless=self.headless, geoip=False)
+        self.browser = await self._camoufox.__aenter__()
+        self.context = await self.browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+        )
+        self.page = await self.context.new_page()
+        print("  ✅ Camoufox 浏览器已启动。")
+
+    async def _start_with_playwright(self):
+        print("  → 使用 Playwright Firefox...")
         from playwright.async_api import async_playwright
         self.playwright = await async_playwright().start()
 
@@ -95,10 +178,12 @@ class BrowserManager:
         except Exception:
             import subprocess
             env = os.environ.copy()
-            subprocess.run(
+            result = subprocess.run(
                 [sys.executable, "-m", "playwright", "install", "firefox"],
                 capture_output=True, text=True, env=env, timeout=120,
             )
+            if result.returncode != 0:
+                raise RuntimeError(f"Playwright Firefox 安装失败: {result.stderr}")
             self.browser = await self.playwright.firefox.launch(
                 headless=self.headless, args=["--no-sandbox"]
             )
@@ -112,193 +197,208 @@ class BrowserManager:
                 "Gecko/20100101 Firefox/126.0"
             ),
         )
-        await self.context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-        )
         self.page = await self.context.new_page()
+        print("  ✅ Playwright Firefox 已启动。")
 
-        auth = AuthHandler(self.page, context=self.context)
-        self.logged_in = await auth.login(self.email, self.password)
+    async def _inject_stealth_scripts(self):
+        if self._engine == "camoufox":
+            await self.context.add_init_script(
+                "if (navigator.webdriver !== undefined) {"
+                "  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+                "}"
+            )
+            print("  🛡️ Camoufox: 最小化反检测脚本")
+        else:
+            await self.context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['zh-CN', 'zh', 'en-US', 'en']
+                });
+                const _origQuery = window.navigator.permissions.query;
+                if (_origQuery) {
+                    window.navigator.permissions.query = (p) => (
+                        p.name === 'notifications'
+                            ? Promise.resolve({ state: Notification.permission })
+                            : _origQuery(p)
+                    );
+                }
+            """)
+            print("  🛡️ Firefox: 注入反检测脚本")
 
-    async def _capture_real_api(self):
-        print("  → 拦截浏览器请求获取认证信息...")
+    async def _inject_helper_scripts(self):
+        """注入 DOM 辅助脚本，用于高效提取回复和检测状态"""
+        await self.page.evaluate("""
+            () => {
+                window.__ds_injected = true;
 
-        captured = []
-
-        async def on_request(request):
-            if request.resource_type in ("fetch", "xhr"):
-                captured.append({
-                    "url": request.url,
-                    "method": request.method,
-                    "headers": dict(request.headers),
-                })
-
-        self.page.on("request", on_request)
-        await asyncio.sleep(3)
-
-        deepseek_reqs = [r for r in captured if "deepseek.com/api" in r["url"]]
-        if not deepseek_reqs:
-            print("  → 触发页面操作以捕获 API 请求...")
-            try:
-                for sel in [
-                    "xpath=//*[contains(text(), '开启新对话')]",
-                    "xpath=//*[contains(text(), 'New chat')]",
-                ]:
-                    try:
-                        btn = self.page.locator(sel).first
-                        if await btn.is_visible(timeout=2000):
-                            await btn.click()
-                            await asyncio.sleep(1)
-                            break
-                    except Exception:
-                        continue
-
-                textarea = self.page.locator("textarea").first
-                await textarea.wait_for(state="visible", timeout=5000)
-                await textarea.fill("test")
-                await textarea.press("Enter")
-                await asyncio.sleep(5)
-            except Exception as e:
-                print(f"  ⚠️ 触发操作失败: {e}")
-
-        self.page.remove_listener("request", on_request)
-
-        for req in captured:
-            if "deepseek.com" not in req["url"]:
-                continue
-            headers = req["headers"]
-            auth_h = headers.get("authorization", "")
-            if auth_h.startswith("Bearer ") and not self._token:
-                self._token = auth_h[7:]
-                print(f"  ✅ Token: {self._token[:30]}...")
-
-            for key in ["x-app-version", "x-client-locale", "x-client-platform",
-                         "x-client-version", "x-client-timezone"]:
-                if key in headers and key not in self._extra_headers:
-                    self._extra_headers[key] = headers[key]
-
-    async def _extract_credentials(self):
-        print("  → 提取凭据...")
-
-        raw_cookies = await self.context.cookies()
-        for c in raw_cookies:
-            self._cookies[c["name"]] = c["value"]
-        print(f"  ✅ Cookie: {len(self._cookies)} 个")
-
-        if self._token:
-            return
-
-        try:
-            token = await self.page.evaluate("""
-                () => {
-                    function extract(raw) {
-                        if (!raw) return null;
-                        try {
-                            const p = JSON.parse(raw);
-                            if (p && typeof p.value === 'string') return p.value;
-                            if (typeof p === 'string') return p;
-                        } catch(e) {}
-                        return raw;
-                    }
-                    for (const k of ['userToken', 'ds_token', 'token', '_token', 'auth_token']) {
-                        const r = localStorage.getItem(k);
-                        if (r) {
-                            const v = extract(r);
-                            if (v && v.length > 20 && !v.startsWith('{') && !v.startsWith('<')) return v;
+                // 获取最后一条回复的文本
+                window.__ds_get_last_reply = () => {
+                    // 方法1：通过 data-virtual-list-item-key 定位（DeepSeek 特有）
+                    const items = document.querySelectorAll('div[data-virtual-list-item-key]');
+                    if (items.length > 0) {
+                        const lastItem = items[items.length - 1];
+                        const mdEls = lastItem.querySelectorAll('[class*="ds-markdown"]');
+                        if (mdEls.length > 0) {
+                            return mdEls[mdEls.length - 1].textContent || '';
                         }
                     }
-                    return null;
-                }
-            """)
-            if token:
-                self._token = token.strip()
-                print(f"  ✅ Token(localStorage): {self._token[:30]}...")
-        except Exception as e:
-            print(f"  ⚠️ {e}")
 
-    async def _refresh_token(self):
-        """从浏览器实时获取最新 token"""
+                    // 方法2：通用 markdown 容器
+                    const allMd = document.querySelectorAll(
+                        '.ds-markdown--block, .ds-markdown, [class*="markdown"]'
+                    );
+                    if (allMd.length > 0) {
+                        return allMd[allMd.length - 1].textContent || '';
+                    }
+                    return '';
+                };
+
+                // 综合检测是否正在生成
+                window.__ds_is_generating = () => {
+                    // 停止按钮存在
+                    const stops = document.querySelectorAll(
+                        '[class*="stop"], [class*="square"], [aria-label*="stop"], [aria-label*="Stop"]'
+                    );
+                    for (const el of stops) {
+                        if (el.offsetParent !== null) return true;
+                    }
+
+                    // loading 动画
+                    const loaders = document.querySelectorAll(
+                        '[class*="loading"], [class*="typing"], [class*="generating"]'
+                    );
+                    for (const el of loaders) {
+                        if (el.offsetParent !== null) return true;
+                    }
+
+                    return false;
+                };
+
+                // 检查复制按钮是否出现（回复完成的可靠标志）
+                window.__ds_has_copy_button = () => {
+                    const items = document.querySelectorAll('div[data-virtual-list-item-key]');
+                    if (items.length === 0) return false;
+                    const lastItem = items[items.length - 1];
+                    const buttons = lastItem.querySelectorAll('div[role="button"]');
+                    return buttons.length > 0;
+                };
+
+                // 回复数量
+                window.__ds_reply_count = () => {
+                    return document.querySelectorAll('div[data-virtual-list-item-key]').length;
+                };
+
+                console.log('[DS Helper] 辅助脚本注入完成');
+            }
+        """)
+        print("  📜 DOM 辅助脚本已注入")
+
+    async def _ensure_helper_injected(self):
+        """确保辅助脚本仍然有效（页面刷新后会丢失）"""
         try:
-            token = await self.page.evaluate("""
-                () => {
-                    for (const k of ['userToken', 'ds_token', 'token', '_token', 'auth_token']) {
-                        const raw = localStorage.getItem(k);
-                        if (!raw) continue;
-                        try {
-                            const p = JSON.parse(raw);
-                            if (p && typeof p.value === 'string' && p.value.length > 20) return p.value;
-                            if (typeof p === 'string' && p.length > 20) return p;
-                        } catch(e) {}
-                        if (raw.length > 20 && !raw.startsWith('{') && !raw.startsWith('<')) return raw;
-                    }
-                    for (const k of ['userToken', 'ds_token', 'token']) {
-                        const raw = sessionStorage.getItem(k);
-                        if (raw && raw.length > 20 && !raw.startsWith('{')) return raw;
-                    }
-                    return null;
-                }
-            """)
-            if token and token.strip():
-                new_token = token.strip()
-                if new_token != self._token:
-                    print(f"  🔄 Token 已更新: {new_token[:30]}...")
-                    self._token = new_token
-        except Exception as e:
-            print(f"  ⚠️ 刷新 token 失败: {e}")
+            injected = await self.page.evaluate("() => window.__ds_injected === true")
+            if not injected:
+                await self._inject_helper_scripts()
+        except Exception:
+            await self._inject_helper_scripts()
 
-    async def _verify_api(self) -> bool:
-        try:
-            result = await self.page.evaluate("""
-                async (token) => {
-                    try {
-                        const resp = await fetch('/api/v0/chat_session/create', {
-                            method: 'POST',
-                            credentials: 'include',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Authorization': 'Bearer ' + token,
-                            },
-                            body: JSON.stringify({}),
-                        });
-                        const data = await resp.json();
-                        return {status: resp.status, data: data};
-                    } catch(e) {
-                        return {error: e.message};
-                    }
-                }
-            """, self._token)
+    # ── 新对话 ──
 
-            print(f"  → 验证状态: {result.get('status')}")
-            if result.get("status") == 200:
-                data = result.get("data", {})
-                if data.get("code") == 0:
-                    biz = data.get("data", {}).get("biz_data", {})
-                    sid = biz.get("id", "")
-                    print(f"  → 验证成功，测试会话: {sid}")
-                    if sid:
-                        try:
-                            await self.page.evaluate("""
-                                async (args) => {
-                                    await fetch('/api/v0/chat_session/delete', {
-                                        method: 'POST',
-                                        credentials: 'include',
-                                        headers: {
-                                            'Content-Type': 'application/json',
-                                            'Authorization': 'Bearer ' + args.token,
-                                        },
-                                        body: JSON.stringify({chat_session_id: args.sid}),
-                                    });
-                                }
-                            """, {"token": self._token, "sid": sid})
-                        except Exception:
-                            pass
+    async def _start_new_chat(self):
+        """开启新对话，确保上下文干净"""
+        print("  → 开启新对话...")
+
+        # 确保在 DeepSeek 页面
+        if "chat.deepseek.com" not in self.page.url:
+            await self.page.goto(
+                "https://chat.deepseek.com/",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await asyncio.sleep(2)
+
+        # 尝试点击"开启新对话"
+        selectors = [
+            "xpath=//*[contains(text(), '开启新对话')]",
+            "xpath=//*[contains(text(), '新对话')]",
+            "xpath=//*[contains(text(), 'New chat')]",
+            "xpath=//*[contains(text(), 'New Chat')]",
+            "div.ds-icon-button",
+            "[class*='new-chat']",
+            "[class*='new_chat']",
+        ]
+
+        for sel in selectors:
+            try:
+                btn = self.page.locator(sel).first
+                if await btn.is_visible(timeout=2000):
+                    await btn.click()
+                    await asyncio.sleep(1)
+                    print("  ✅ 已开启新对话")
                     return True
-            return False
-        except Exception as e:
-            print(f"  → 验证异常: {e}")
-            return False
+            except Exception:
+                continue
 
-    # ─── 核心发送方法 ───
+        # 都失败则导航到主页
+        await self.page.goto(
+            "https://chat.deepseek.com/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        await asyncio.sleep(3)
+        print("  ✅ 已导航到新对话页面")
+        return True
+
+    # ── 输入并发送 ──
+
+    async def _type_and_send(self, message: str):
+        """定位输入框，输入消息，发送"""
+        # 等待输入框
+        textarea = self.page.locator(
+            "textarea[placeholder*='DeepSeek'], "
+            "textarea[placeholder*='发送消息'], "
+            "textarea, "
+            "[contenteditable='true']"
+        ).first
+        await textarea.wait_for(state="visible", timeout=10000)
+        await textarea.click()
+        await asyncio.sleep(0.3)
+
+        # 先尝试 fill（模拟粘贴，速度快），失败则用 JS 注入
+        try:
+            await textarea.fill("")
+            await asyncio.sleep(0.2)
+            await textarea.fill(message)
+        except Exception:
+            # fill 失败，用 JS 直接设值
+            await self.page.evaluate("""
+                (text) => {
+                    const el = document.querySelector('textarea')
+                        || document.querySelector('[contenteditable="true"]');
+                    if (!el) return;
+                    if (el.tagName === 'TEXTAREA') {
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, 'value'
+                        ).set;
+                        setter.call(el, text);
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    } else {
+                        el.innerText = text;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                }
+            """, message)
+
+        await asyncio.sleep(0.5)
+        print(f"  → 已输入消息，长度: {len(message)}")
+
+        # 发送：先尝试 Enter，因为 DeepSeek 默认 Enter 发送
+        await textarea.press("Enter")
+        print("  → 消息已发送")
+        await asyncio.sleep(2)
+
+    # ── 核心发送方法 ──
 
     async def send_message(self, message: str) -> str:
         full = ""
@@ -307,7 +407,14 @@ class BrowserManager:
         return full
 
     async def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
-        # ── 等待就绪 ──
+        """
+        发送消息并流式返回响应。
+        
+        合并两版优点：
+        - 旧版的完成检测（复制按钮 + 停止按钮 + stable_count）
+        - 新版的就绪控制和辅助脚本预注入
+        """
+        # 等待就绪
         if not self._ready:
             print("  ⏳ 请求等待浏览器初始化完成...")
             ok = await self.wait_until_ready(timeout=180)
@@ -315,353 +422,221 @@ class BrowserManager:
                 yield "[错误] 浏览器初始化超时，请稍后重试"
                 return
 
-        self.total_requests += 1
-        req_id = self.total_requests
-        print(f"📨 请求 #{req_id} (长度: {len(message)} 字符)")
+        # 加锁
+        async with self._lock:
+            self.total_requests += 1
+            self.requests_handled += 1
+            req_id = self.total_requests
+            print(f"📨 请求 #{req_id} (长度: {len(message)} 字符)")
+            print(f"  → 预览: {message[:100]}...")
 
-        if not self.page:
-            yield "[错误] 浏览器未就绪"
-            return
-
-        try:
-            # 每次请求前尝试刷新 token
-            await self._refresh_token()
-
-            # ── Step 1: 创建会话 ──
-            session_result = await self._api_create_session()
-
-            # 如果 token 失效，尝试仅用 Cookie
-            if session_result.get("code") == 40003:
-                print(f"  [{req_id}] Token 失效(40003)，尝试仅用 Cookie 认证...")
-                self._token = ""
-                session_result = await self._api_create_session()
-                print(f"  [{req_id}] Cookie-only 结果: code={session_result.get('code')}")
-
-            if session_result.get("error") or session_result.get("code") != 0:
-                err_msg = session_result.get("msg", session_result.get("error", "未知错误"))
-                print(f"  [{req_id}] ❌ 创建会话失败: {err_msg}")
-                yield f"[错误] 创建会话失败: {err_msg}"
+            if not self.page:
+                yield "[错误] 浏览器未就绪"
                 return
 
-            biz_data = session_result["data"]["biz_data"]
-            chat_session_id = biz_data["id"]
-            print(f"  [{req_id}] 会话: {chat_session_id}")
-
-            # ── Step 2: 获取并求解 PoW ──
-            pow_header = await self._solve_pow_challenge(req_id)
-
-            # ── Step 3: 浏览器内 SSE 流式请求 ──
-            await self.page.evaluate("""
-                () => {
-                    window.__ds_stream_chunks = [];
-                    window.__ds_stream_done = false;
-                    window.__ds_stream_error = null;
-                }
-            """)
-
-            await self.page.evaluate("""
-                (params) => {
-                    const {token, session_id, prompt, pow_header} = params;
-                    const headers = {
-                        'Content-Type': 'application/json',
-                        'Accept': 'text/event-stream',
-                    };
-                    if (token) {
-                        headers['Authorization'] = 'Bearer ' + token;
-                    }
-                    if (pow_header) {
-                        headers['x-ds-pow-response'] = pow_header;
-                    }
-
-                    fetch('/api/v0/chat/completion', {
-                        method: 'POST',
-                        credentials: 'include',
-                        headers: headers,
-                        body: JSON.stringify({
-                            chat_session_id: session_id,
-                            parent_message_id: null,
-                            prompt: prompt,
-                            ref_file_ids: [],
-                            thinking_enabled: false,
-                            search_enabled: false,
-                        }),
-                    }).then(async (resp) => {
-                        if (!resp.ok) {
-                            const text = await resp.text();
-                            window.__ds_stream_error = 'HTTP ' + resp.status + ': ' + text.substring(0, 500);
-                            window.__ds_stream_done = true;
-                            return;
-                        }
-
-                        const reader = resp.body.getReader();
-                        const decoder = new TextDecoder();
-                        let buffer = '';
-
-                        while (true) {
-                            const {done, value} = await reader.read();
-                            if (done) break;
-
-                            buffer += decoder.decode(value, {stream: true});
-                            const lines = buffer.split('\\n');
-                            buffer = lines.pop();
-
-                            for (const line of lines) {
-                                if (line.startsWith('data: ')) {
-                                    const data = line.substring(6).trim();
-                                    if (data === '[DONE]') {
-                                        window.__ds_stream_done = true;
-                                        return;
-                                    }
-                                    try {
-                                        const parsed = JSON.parse(data);
-                                        const choices = parsed.choices || [];
-                                        if (choices.length > 0) {
-                                            const delta = choices[0].delta || {};
-                                            const content = delta.content || '';
-                                            if (content) {
-                                                window.__ds_stream_chunks.push(content);
-                                            }
-                                        }
-                                    } catch(e) {}
-                                }
-                            }
-                        }
-                        window.__ds_stream_done = true;
-                    }).catch((e) => {
-                        window.__ds_stream_error = e.message;
-                        window.__ds_stream_done = true;
-                    });
-                }
-            """, {
-                "token": self._token,
-                "session_id": chat_session_id,
-                "prompt": message,
-                "pow_header": pow_header,
-            })
-
-            # ── Step 4: 轮询读取结果 ──
-            read_index = 0
-            full_text = ""
-            max_wait = 300.0
-            waited = 0.0
-            idle_count = 0
-
-            while waited < max_wait:
-                result = await self.page.evaluate("""
-                    (fromIndex) => {
-                        return {
-                            chunks: window.__ds_stream_chunks.slice(fromIndex),
-                            total: window.__ds_stream_chunks.length,
-                            done: window.__ds_stream_done,
-                            error: window.__ds_stream_error,
-                        };
-                    }
-                """, read_index)
-
-                if result.get("error"):
-                    err_msg = result["error"]
-                    print(f"  [{req_id}] ❌ 流式错误: {err_msg}")
-                    yield f"[错误] {err_msg}"
-                    break
-
-                new_chunks = result.get("chunks", [])
-                for chunk in new_chunks:
-                    full_text += chunk
-                    yield chunk
-                read_index += len(new_chunks)
-
-                if result.get("done"):
-                    if not new_chunks:
-                        break
-                    continue
-
-                if new_chunks:
-                    idle_count = 0
-                else:
-                    idle_count += 1
-
-                sleep_time = 0.05 if idle_count < 20 else 0.2
-                await asyncio.sleep(sleep_time)
-                waited += sleep_time
-
-            # ── 清理会话 ──
             try:
-                await self.page.evaluate("""
-                    async (args) => {
-                        const headers = {'Content-Type': 'application/json'};
-                        if (args.token) headers['Authorization'] = 'Bearer ' + args.token;
-                        await fetch('/api/v0/chat_session/delete', {
-                            method: 'POST',
-                            credentials: 'include',
-                            headers: headers,
-                            body: JSON.stringify({chat_session_id: args.sid}),
-                        });
-                    }
-                """, {"token": self._token, "sid": chat_session_id})
-            except Exception:
-                pass
+                # 确保辅助脚本有效
+                await self._ensure_helper_injected()
 
-            print(f"  [{req_id}] ✅ 完成，长度: {len(full_text)}")
+                # 开启新对话
+                await self._start_new_chat()
+                await asyncio.sleep(1)
 
-        except Exception as e:
-            print(f"  [{req_id}] ❌ {e}")
-            import traceback
-            traceback.print_exc()
-            yield f"[错误] {str(e)}"
+                # 再次确保辅助脚本（新对话可能导致页面变化）
+                await self._ensure_helper_injected()
 
-    # ─── 内部辅助方法 ───
+                # 记录发送前的回复数量
+                reply_count_before = await self.page.evaluate(
+                    "() => window.__ds_reply_count()"
+                )
 
-    async def _api_create_session(self) -> dict:
-        """在浏览器内创建聊天会话"""
-        return await self.page.evaluate("""
-            async (token) => {
-                try {
-                    const headers = {'Content-Type': 'application/json'};
-                    if (token) headers['Authorization'] = 'Bearer ' + token;
-                    const resp = await fetch('/api/v0/chat_session/create', {
-                        method: 'POST',
-                        credentials: 'include',
-                        headers: headers,
-                        body: JSON.stringify({}),
-                    });
-                    return await resp.json();
-                } catch(e) {
-                    return {error: e.message};
-                }
-            }
-        """, self._token)
+                # 输入并发送
+                await self._type_and_send(message)
 
-    async def _solve_pow_challenge(self, req_id: int) -> str:
-        """获取并求解 PoW，返回 header 字符串"""
-        pow_result = await self.page.evaluate("""
-            async (token) => {
-                try {
-                    const headers = {'Content-Type': 'application/json'};
-                    if (token) headers['Authorization'] = 'Bearer ' + token;
-                    const resp = await fetch('/api/v0/chat/create_pow_challenge', {
-                        method: 'POST',
-                        credentials: 'include',
-                        headers: headers,
-                        body: JSON.stringify({target_path: '/api/v0/chat/completion'}),
-                    });
-                    return await resp.json();
-                } catch(e) {
-                    return {error: e.message};
-                }
-            }
-        """, self._token)
+                # ── 等待回复出现 ──
+                print(f"  [{req_id}] 等待回复...")
+                last_text = ""
+                stable_count = 0
+                max_wait_seconds = 600  # 最多等10分钟
+                response_started = False
 
-        if pow_result.get("code") != 0:
-            print(f"  [{req_id}] ⚠️ PoW challenge 获取失败: {pow_result.get('msg', '')}")
-            return ""
+                for tick in range(max_wait_seconds * 2):  # 每0.5秒一次
+                    await asyncio.sleep(0.5)
 
-        challenge_data = pow_result["data"]["biz_data"]["challenge"]
-        algorithm = challenge_data.get("algorithm", "")
-        challenge = challenge_data.get("challenge", "")
-        salt = challenge_data.get("salt", "")
-        difficulty = challenge_data.get("difficulty", 0)
+                    try:
+                        current_text = await self.page.evaluate(
+                            "() => window.__ds_get_last_reply()"
+                        )
+                        is_generating = await self.page.evaluate(
+                            "() => window.__ds_is_generating()"
+                        )
+                        has_copy_btn = await self.page.evaluate(
+                            "() => window.__ds_has_copy_button()"
+                        )
+                        current_count = await self.page.evaluate(
+                            "() => window.__ds_reply_count()"
+                        )
+                    except Exception:
+                        # 页面可能刷新了，重新注入
+                        await self._ensure_helper_injected()
+                        continue
 
-        print(f"  [{req_id}] PoW: algo={algorithm} diff={difficulty}")
+                    current_text = (current_text or "").strip()
 
-        pow_answer = self._solve_pow_python(challenge, salt, difficulty)
+                    # 检测回复开始
+                    if not response_started:
+                        if current_text and current_count > reply_count_before:
+                            response_started = True
+                            print(f"  [{req_id}] 回复开始")
+                        elif is_generating:
+                            response_started = True
+                            print(f"  [{req_id}] 检测到生成中")
+                        elif tick > 120:  # 60秒还没开始
+                            print(f"  [{req_id}] ❌ 等待回复超时（60秒）")
+                            yield "[错误] 等待回复超时"
+                            return
+                        continue
 
-        if pow_answer and not pow_answer.get("error"):
-            print(f"  [{req_id}] PoW 已解决: nonce={pow_answer['nonce']}")
-            return f"{algorithm}_{challenge}_{salt}_{pow_answer['nonce']}"
-        else:
-            print(f"  [{req_id}] ⚠️ PoW 求解失败")
-            return ""
+                    # 回复已开始，流式输出
+                    if current_text and len(current_text) > len(last_text):
+                        new_part = current_text[len(last_text):]
+                        last_text = current_text
+                        stable_count = 0
+                        yield new_part
+                    elif current_text == last_text:
+                        stable_count += 1
 
-    def _solve_pow_python(self, challenge: str, salt: str, difficulty: int) -> dict:
-        """Python SHA3-256 PoW 求解"""
-        print(f"    PoW 求解中: difficulty={difficulty} ...")
-        start = time.time()
-        try:
-            for nonce in range(100_000_000):
-                input_str = f"{salt}_{nonce}_{challenge}"
-                hash_bytes = hashlib.sha3_256(input_str.encode()).digest()
+                    # 完成检测（三重保障）
+                    # 1. 复制按钮出现 + 不在生成 + 文本稳定
+                    if has_copy_btn and not is_generating and stable_count >= 3:
+                        print(f"  [{req_id}] ✅ 完成（复制按钮可用）")
+                        break
 
-                leading_zeros = 0
-                for byte in hash_bytes:
-                    if byte == 0:
-                        leading_zeros += 8
+                    # 2. 不在生成 + 有内容 + 文本稳定较长时间
+                    if not is_generating and current_text and stable_count >= 10:
+                        print(f"  [{req_id}] ✅ 完成（生成停止 + 文本稳定）")
+                        break
+
+                    # 3. 文本超长时间无变化
+                    if stable_count >= 60:  # 30秒无变化
+                        print(f"  [{req_id}] ⏹️ 超时（文本30秒无变化）")
+                        break
+
+                    # 进度日志
+                    if tick > 0 and tick % 20 == 0:
+                        print(
+                            f"  [{req_id}] ⏳ tick={tick}, "
+                            f"len={len(current_text)}, "
+                            f"gen={is_generating}, "
+                            f"copy={has_copy_btn}, "
+                            f"stable={stable_count}"
+                        )
+
+                # ── 兜底：如果完全没有获取到内容 ──
+                if not last_text:
+                    fallback = await self.page.evaluate("""
+                        () => {
+                            const allMd = document.querySelectorAll('[class*="ds-markdown"]');
+                            if (allMd.length > 0) {
+                                return allMd[allMd.length - 1].textContent || '';
+                            }
+                            return '';
+                        }
+                    """)
+                    if fallback and fallback.strip():
+                        print(f"  [{req_id}] ⚠️ 兜底获取回复，长度: {len(fallback)}")
+                        yield fallback.strip()
                     else:
-                        b = byte
-                        while (b & 0x80) == 0:
-                            leading_zeros += 1
-                            b <<= 1
-                        break
-                    if leading_zeros >= difficulty:
-                        break
+                        print(f"  [{req_id}] ❌ 完全未获取到响应")
+                        try:
+                            ss = await self.take_screenshot_base64()
+                            if ss:
+                                print(f"  [{req_id}] 📸 调试截图已生成")
+                        except Exception:
+                            pass
+                        yield "抱歉，未能获取到响应。请稍后重试。"
 
-                if leading_zeros >= difficulty:
-                    elapsed = time.time() - start
-                    print(f"    PoW 求解成功: nonce={nonce}, 耗时={elapsed:.2f}s")
-                    return {"nonce": str(nonce), "result": hash_bytes.hex()}
+                print(f"  [{req_id}] 📊 最终长度: {len(last_text)} 字符")
 
-                if nonce > 0 and nonce % 1_000_000 == 0:
-                    elapsed = time.time() - start
-                    print(f"    PoW 进度: {nonce} 次, 耗时={elapsed:.1f}s")
+            except Exception as e:
+                print(f"  [{req_id}] ❌ {e}")
+                import traceback
+                traceback.print_exc()
+                yield f"[错误] {str(e)}"
 
-        except Exception as e:
-            print(f"    PoW 异常: {e}")
-
-        return {"error": "PoW failed"}
+    # ── 其他 ──
 
     async def is_alive(self) -> bool:
-        """检查浏览器页面是否存活"""
-        if not self._ready or not self.page:
-            return False
         try:
-            result = await self.page.evaluate("() => document.title")
-            return bool(result)
+            if not self._ready or not self.page or self.page.is_closed():
+                return False
+            await self.page.evaluate("() => document.title")
+            return True
         except Exception:
             return False
 
     async def get_status(self) -> dict:
-        alive = await self.is_alive() if self.page else False
+        alive = await self.is_alive()
         return {
-            "logged_in": self.logged_in,
             "browser_alive": alive,
+            "logged_in": self.logged_in,
             "ready": self._ready,
-            "mode": "browser-resident",
-            "api_base": self._api_base,
-            "has_token": bool(self._token),
-            "cookie_count": len(self._cookies),
+            "engine": self._engine,
+            "mode": "dom-interaction",
             "uptime_seconds": time.time() - self.start_time,
-            "total_requests": self.total_requests,
             "heartbeat_count": self.heartbeat_count,
-            "requests_handled": self.total_requests,
-            "engine": "playwright-firefox",
+            "requests_handled": self.requests_handled,
+            "total_requests": self.total_requests,
+            "has_token": True,
+            "cookie_count": 0,
+            "current_url": self.page.url if self.page and not self.page.is_closed() else "N/A",
             "timestamp": datetime.now().isoformat(),
         }
 
     async def take_screenshot_base64(self) -> Optional[str]:
-        if not self.page:
-            return None
         try:
+            if not self.page or self.page.is_closed():
+                return None
             buf = await self.page.screenshot(full_page=False)
-            import base64
-            return base64.b64encode(buf).decode()
-        except Exception:
+            return base64.b64encode(buf).decode("utf-8")
+        except Exception as e:
+            print(f"❌ 截图失败: {e}")
             return None
 
     async def simulate_activity(self):
-        self.heartbeat_count += 1
-        if self.page:
-            try:
-                await self.page.evaluate("() => document.title")
-            except Exception:
-                pass
+        if not self.page or self.page.is_closed():
+            return
+        try:
+            self.heartbeat_count += 1
+            import random
+            x = random.randint(100, 1800)
+            y = random.randint(100, 900)
+            await self.page.mouse.move(x, y)
+            await self.page.evaluate("""
+                () => {
+                    document.dispatchEvent(new MouseEvent('mousemove', {
+                        clientX: Math.random() * window.innerWidth,
+                        clientY: Math.random() * window.innerHeight
+                    }));
+                    window.scrollBy(0, Math.random() > 0.5 ? 1 : -1);
+                    window.dispatchEvent(new Event('focus'));
+                }
+            """)
+            if self.heartbeat_count % 10 == 0:
+                print(f"💓 心跳 #{self.heartbeat_count}")
+        except Exception as e:
+            print(f"⚠️ 心跳异常: {e}")
 
     async def shutdown(self):
         try:
+            if hasattr(self, '_save_camoufox_cache'):
+                self._save_camoufox_cache()
             if self.context:
                 await self.context.close()
             if self.browser:
                 await self.browser.close()
             if self.playwright:
                 await self.playwright.stop()
-            print("🔒 已关闭。")
+            print("🔒 浏览器已安全关闭。")
         except Exception as e:
-            print(f"⚠️ {e}")
+            print(f"⚠️ 关闭浏览器时出错: {e}")
