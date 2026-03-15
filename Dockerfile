@@ -38,23 +38,27 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
-# ===== 关键修改：使用 camoufox fetch 预下载浏览器 =====
-# 创建缓存目录并设置权限
-RUN mkdir -p /home/app_user/.cache && chown -R app_user:app_user /home/app_user/.cache
+# ===== 核心：预安装 Playwright Firefox（默认引擎）=====
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
+RUN python -m playwright install firefox \
+    && python -m playwright install-deps firefox \
+    && chown -R app_user:app_user /opt/browsers
 
-# 切换到 app_user 运行 fetch 命令
+# ===== 可选：尝试预下载 Camoufox（失败不影响启动）=====
+RUN mkdir -p /home/app_user/.cache && chown -R app_user:app_user /home/app_user/.cache
 USER app_user
 ENV CAMOUFOX_NO_UPDATE_CHECK=1
-# 运行 fetch 命令下载浏览器到 ~/.cache/camoufox
-RUN python -c "from camoufox.sync_api import CamoufoxSync; CamoufoxSync.fetch()" || echo "Camoufox fetch failed, will retry at runtime"
+RUN python -c "from camoufox.sync_api import Camoufox; print('Camoufox available')" 2>/dev/null \
+    && python -c "import camoufox; camoufox.fetch()" 2>/dev/null \
+    || echo "⚠️ Camoufox 预下载跳过，运行时将使用 Playwright Firefox"
 
 # 切换回 root 复制应用代码
 USER root
 COPY --chown=app_user:app_user . .
 
-# 预安装 Playwright Firefox 作为后备（可选）
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
-RUN python -m playwright install firefox && chown -R app_user:app_user /opt/browsers
+# 设置默认环境变量
+ENV API_SECRET_KEY=zxcvbnm
+ENV HEADLESS=true
 
 # 最终以 app_user 运行
 USER app_user
