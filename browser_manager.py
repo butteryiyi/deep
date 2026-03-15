@@ -1,10 +1,10 @@
 # browser_manager.py
 """
-浏览器生命周期管理器（Cookie 注入版）：
-- 支持 Cookie 注入登录
-- 修复响应提取逻辑，与本地 deepseek_proxy.py 一致
-- 每次请求开启新对话，确保上下文由 prompt 自行携带
-- 优化：Docker 构建时预装 Camoufox，运行时不再下载
+浏览器生命周期管理器（修复版）：
+核心修复：
+1. Camoufox AsyncCamoufox 上下文管理器生命周期正确处理
+2. 增加启动超时保护
+3. 浏览器崩溃自动恢复
 """
 
 import os
@@ -13,7 +13,6 @@ import time
 import json
 import asyncio
 import base64
-import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import AsyncGenerator, Optional
@@ -32,6 +31,7 @@ class BrowserManager:
         self.heartbeat_count = 0
         self.requests_handled = 0
         self._lock = asyncio.Lock()
+        self._camoufox_cm = None  # 保持上下文管理器引用，防止被 GC
 
         self.email = os.getenv("DEEPSEEK_EMAIL", "")
         self.password = os.getenv("DEEPSEEK_PASSWORD", "")
@@ -39,17 +39,16 @@ class BrowserManager:
         self._engine = "unknown"
 
     def _check_camoufox_installed(self) -> bool:
-        """检查 Camoufox 是否已预装（Docker 构建阶段安装）"""
+        """检查 Camoufox 是否已预装"""
         try:
             from camoufox.pkgman import get_path
             path = get_path("camoufox")
             if path and Path(path).exists():
                 print(f"  ✅ Camoufox 已预装: {path}")
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  ⚠️ 检查 Camoufox 路径时出错: {e}")
 
-        # 检查常见安装路径
         home_cache = Path.home() / ".cache" / "camoufox"
         if home_cache.exists() and any(home_cache.iterdir()):
             print(f"  ✅ 发现 Camoufox 缓存: {home_cache}")
@@ -58,43 +57,42 @@ class BrowserManager:
         return False
 
     async def initialize(self):
+        """初始化浏览器，带完整的错误处理和回退逻辑"""
         print("🔧 正在初始化浏览器...")
 
-        if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
-            if os.path.isdir("/opt/browsers"):
-                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/browsers"
+        os.environ['CAMOUFOX_NO_UPDATE_CHECK'] = '1'
 
-        camoufox_succeeded = False
-        try:
-            os.environ['CAMOUFOX_NO_UPDATE_CHECK'] = '1'
+        # 尝试 Camoufox
+        camoufox_ok = False
+        if self._check_camoufox_installed():
+            print("  📦 使用预装的 Camoufox（跳过下载）")
+            try:
+                await asyncio.wait_for(self._start_with_camoufox(), timeout=60)
+                camoufox_ok = True
+                self._engine = "camoufox"
+                print("  ✅ Camoufox 启动成功")
+            except asyncio.TimeoutError:
+                print("  ⚠️ Camoufox 启动超时（60秒），回退到 Playwright")
+                await self._cleanup_camoufox()
+            except Exception as e:
+                print(f"  ⚠️ Camoufox 启动失败: {e}")
+                await self._cleanup_camoufox()
 
-            # 检查是否已预装，不再尝试下载
-            if self._check_camoufox_installed():
-                print("  📦 使用预装的 Camoufox（跳过下载）")
-            else:
-                print("  ⚠️ Camoufox 未预装，将尝试在线安装（可能很慢）...")
+        # 回退到 Playwright Firefox
+        if not camoufox_ok:
+            try:
+                await asyncio.wait_for(self._start_with_playwright(), timeout=60)
+                self._engine = "playwright-firefox"
+                print("  ✅ Playwright Firefox 启动成功")
+            except asyncio.TimeoutError:
+                raise RuntimeError("Playwright Firefox 启动超时（60秒）")
+            except Exception as e:
+                raise RuntimeError(f"Playwright Firefox 启动失败: {e}")
 
-            from camoufox.async_api import AsyncCamoufox
-            self._camoufox_cls = AsyncCamoufox
-            await self._start_with_camoufox()
-            camoufox_succeeded = True
-            self._engine = "camoufox"
-        except Exception as e:
-            print(f"⚠️ Camoufox 启动失败: {e}")
-            print("⚠️ 将回退到 Playwright Firefox...")
-            if hasattr(self, '_camoufox'):
-                try:
-                    await self._camoufox.__aexit__(None, None, None)
-                except:
-                    pass
-            camoufox_succeeded = False
-
-        if not camoufox_succeeded:
-            await self._start_with_playwright()
-            self._engine = "playwright-firefox"
-
+        # 注入反检测脚本
         await self._inject_stealth_scripts()
 
+        # Cookie 注入登录
         auth = AuthHandler(self.page, context=self.context)
         self.logged_in = await auth.login(self.email, self.password)
 
@@ -103,45 +101,88 @@ class BrowserManager:
         else:
             print("⚠️ 登录可能未完成，请检查 /screenshot 端点。")
 
+    async def _cleanup_camoufox(self):
+        """安全清理 Camoufox 资源"""
+        try:
+            if self.page and not self.page.is_closed():
+                await self.page.close()
+        except Exception:
+            pass
+        try:
+            if self.context:
+                await self.context.close()
+        except Exception:
+            pass
+        try:
+            if self._camoufox_cm:
+                await self._camoufox_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+        self.page = None
+        self.context = None
+        self.browser = None
+        self._camoufox_cm = None
+
     async def _start_with_camoufox(self):
+        """使用 Camoufox 启动浏览器 —— 修复生命周期管理"""
         print("  → 使用 Camoufox 反指纹浏览器...")
         from camoufox.async_api import AsyncCamoufox
 
-        try:
-            self._camoufox = AsyncCamoufox(headless=self.headless, geoip=False)
-        except TypeError:
-            self._camoufox = AsyncCamoufox(headless=self.headless, geoip=False)
-
-        self.browser = await self._camoufox.__aenter__()
-        self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
+        # 创建上下文管理器并保持引用
+        self._camoufox_cm = AsyncCamoufox(
+            headless=self.headless,
+            geoip=False,
         )
-        self.page = await self.context.new_page()
+
+        # 进入上下文，获取 browser
+        self.browser = await self._camoufox_cm.__aenter__()
+
+        # 等一下让浏览器完全就绪
+        await asyncio.sleep(2)
+
+        # 检查浏览器是否真的活着
+        if not self.browser.is_connected():
+            raise RuntimeError("Camoufox browser 启动后立即断开连接")
+
+        # 创建上下文和页面
+        try:
+            self.context = await self.browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+            await asyncio.sleep(1)
+            self.page = await self.context.new_page()
+        except Exception as e:
+            # 如果 new_context 或 new_page 失败，说明浏览器已经崩溃
+            raise RuntimeError(f"Camoufox 创建页面失败: {e}")
+
         print("  ✅ Camoufox 浏览器已启动。")
 
     async def _start_with_playwright(self):
+        """使用 Playwright Firefox 启动浏览器"""
         print("  → 回退到 Playwright Firefox...")
         from playwright.async_api import async_playwright
+
         self.playwright = await async_playwright().start()
 
         try:
             self.browser = await self.playwright.firefox.launch(
-                headless=self.headless, args=["--no-sandbox"]
+                headless=self.headless,
+                args=["--no-sandbox"],
             )
         except Exception as launch_error:
-            print(f"  ⚠️ Firefox 启动失败: {launch_error}")
+            print(f"  ⚠️ Firefox 启动失败: {launch_error}，尝试安装...")
             import subprocess
-            env = os.environ.copy()
             result = subprocess.run(
                 [sys.executable, "-m", "playwright", "install", "firefox"],
-                capture_output=True, text=True, env=env, timeout=120,
+                capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"Playwright Firefox 安装失败: {result.stderr}")
             self.browser = await self.playwright.firefox.launch(
-                headless=self.headless, args=["--no-sandbox"]
+                headless=self.headless,
+                args=["--no-sandbox"],
             )
 
         self.context = await self.browser.new_context(
@@ -157,6 +198,7 @@ class BrowserManager:
         print("  ✅ Playwright Firefox 已启动。")
 
     async def _inject_stealth_scripts(self):
+        """注入反检测脚本"""
         if self._engine == "camoufox":
             minimal_js = """
             if (navigator.webdriver !== undefined) {
@@ -184,8 +226,11 @@ class BrowserManager:
             print("  🛡️ Firefox 模式：注入兼容的反检测脚本")
 
     async def is_alive(self) -> bool:
+        """检查浏览器是否存活"""
         try:
             if not self.page or self.page.is_closed():
+                return False
+            if not self.browser or not self.browser.is_connected():
                 return False
             await self.page.evaluate("() => document.title")
             return True
@@ -228,7 +273,9 @@ class BrowserManager:
             print(f"  → 内容预览: {message[:100]}...")
 
             try:
-                if "chat.deepseek.com" not in self.page.url:
+                # 确保在正确的页面上
+                current_url = self.page.url if self.page else ""
+                if "chat.deepseek.com" not in current_url:
                     await self.page.goto(
                         "https://chat.deepseek.com/",
                         wait_until="networkidle",
@@ -236,6 +283,7 @@ class BrowserManager:
                     )
                     await asyncio.sleep(2)
 
+                # 开启新对话
                 print("  → 正在开启新的对话以保证上下文干净...")
                 try:
                     new_chat_btn = self.page.locator(
@@ -245,8 +293,7 @@ class BrowserManager:
                     await new_chat_btn.click()
                     await asyncio.sleep(1)
                     print("  ✅ 已开启新对话")
-                except Exception as e:
-                    print(f"  ⚠️ 未找到'开启新对话'按钮: {e}")
+                except Exception:
                     try:
                         icon_btn = self.page.locator(
                             "div.ds-icon-button, [class*='new-chat']"
@@ -257,6 +304,7 @@ class BrowserManager:
                     except Exception:
                         pass
 
+                # 输入消息
                 textarea = self.page.locator(
                     "textarea[placeholder*='DeepSeek'], "
                     "textarea[placeholder*='发送消息'], "
@@ -269,15 +317,16 @@ class BrowserManager:
 
                 await textarea.fill("")
                 await asyncio.sleep(0.2)
-
                 await textarea.fill(message)
                 await asyncio.sleep(0.5)
                 print(f"  → 已输入消息，长度: {len(message)}")
 
+                # 发送
                 await textarea.press("Enter")
                 print("  → 消息已发送，等待模型响应...")
                 await asyncio.sleep(2)
 
+                # 流式读取响应
                 last_text = ""
                 stable_count = 0
                 max_wait_seconds = 600
@@ -292,21 +341,16 @@ class BrowserManager:
                             if (items.length === 0) {
                                 return { text: '', done: false, itemCount: 0, hasButton: false };
                             }
-                            
                             const lastItem = items[items.length - 1];
-                            
                             const mdEls = lastItem.querySelectorAll('[class*="ds-markdown"]');
                             let text = '';
                             if (mdEls.length > 0) {
                                 text = mdEls[mdEls.length - 1].textContent || '';
                             }
-                            
                             const buttons = lastItem.querySelectorAll('div[role="button"]');
                             const hasButton = buttons.length > 0;
-                            
                             const stopBtn = document.querySelector('[class*="stop"], [class*="square"]');
                             const isGenerating = !!stopBtn;
-                            
                             return { 
                                 text: text, 
                                 done: hasButton && !isGenerating,
@@ -351,12 +395,11 @@ class BrowserManager:
                         print("  ⏹️ 响应超时（文本 30 秒无变化）。")
                         break
 
+                # 兜底
                 if not last_text:
                     fallback_text = await self.page.evaluate("""
                         () => {
-                            const allMd = document.querySelectorAll(
-                                '[class*="ds-markdown"]'
-                            );
+                            const allMd = document.querySelectorAll('[class*="ds-markdown"]');
                             if (allMd.length > 0) {
                                 return allMd[allMd.length - 1].textContent || '';
                             }
@@ -368,12 +411,6 @@ class BrowserManager:
                         yield fallback_text.strip()
                     else:
                         print("  ❌ 完全未能获取到响应")
-                        try:
-                            ss = await self.take_screenshot_base64()
-                            if ss:
-                                print(f"  📸 调试截图 base64 长度: {len(ss)}")
-                        except Exception:
-                            pass
                         yield "抱歉，未能获取到响应。请稍后重试。"
 
                 print(f"  📊 最终回复长度: {len(last_text)} 字符")
@@ -386,6 +423,7 @@ class BrowserManager:
                 yield f"[错误] {error_msg}"
 
     async def simulate_activity(self):
+        """心跳模拟活动"""
         if not self.page or self.page.is_closed():
             return
         try:
@@ -410,13 +448,32 @@ class BrowserManager:
             print(f"⚠️ 心跳异常: {e}")
 
     async def shutdown(self):
+        """安全关闭所有资源"""
+        try:
+            if self.page and not self.page.is_closed():
+                await self.page.close()
+        except Exception:
+            pass
+
         try:
             if self.context:
                 await self.context.close()
-            if self.browser:
+        except Exception:
+            pass
+
+        try:
+            if self._camoufox_cm:
+                await self._camoufox_cm.__aexit__(None, None, None)
+                self._camoufox_cm = None
+            elif self.browser:
                 await self.browser.close()
+        except Exception:
+            pass
+
+        try:
             if self.playwright:
                 await self.playwright.stop()
-            print("🔒 浏览器已安全关闭。")
-        except Exception as e:
-            print(f"⚠️ 关闭浏览器时出错: {e}")
+        except Exception:
+            pass
+
+        print("🔒 浏览器已安全关闭。")
