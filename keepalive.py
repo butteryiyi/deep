@@ -18,16 +18,21 @@ class KeepaliveService:
         self.interval = interval
         self._task: asyncio.Task = None
         self._running = False
+        self.is_running = False  # 对外暴露的运行状态
 
     async def start(self):
-        """启动心跳循环。"""
+        """启动心跳循环。如果已经在运行，则忽略。"""
+        if self.is_running:
+            return
         self._running = True
+        self.is_running = True
         self._task = asyncio.create_task(self._heartbeat_loop())
         print(f"💓 心跳服务已启动（间隔: {self.interval}s）")
 
     async def stop(self):
         """停止心跳循环。"""
         self._running = False
+        self.is_running = False
         if self._task:
             self._task.cancel()
             try:
@@ -41,8 +46,10 @@ class KeepaliveService:
         while self._running:
             try:
                 await asyncio.sleep(self.interval)
-                if self._running and self.browser_mgr:
+                # 只有浏览器就绪时才执行模拟活动
+                if self._running and self.browser_mgr and await self.browser_mgr.is_alive():
                     await self.browser_mgr.simulate_activity()
+                # 如果浏览器未就绪，则静默跳过
             except asyncio.CancelledError:
                 break
             except Exception as e:
