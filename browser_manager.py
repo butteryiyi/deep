@@ -296,7 +296,7 @@ class BrowserManager:
                 yield f"[错误] 创建会话失败: {json.dumps(session_result, ensure_ascii=False)[:200]}"
                 return
 
-            chat_session_id = session_result["data"]["biz_data"]["chat_session"]["id"]
+            chat_session_id = session_result["data"]["biz_data"]["id"]
             print(f"  [{req_id}] 会话: {chat_session_id}")
 
             # Step 2: 获取 PoW Challenge
