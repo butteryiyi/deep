@@ -1,10 +1,9 @@
 # browser_manager.py
 """
-DeepSeek 反代（初始化脚本拦截模式）
-- 用 addInitScript 在页面最早期 patch fetch/XMLHttpRequest
-- 真正逐 chunk 实时读取 SSE，不等完整响应
-- 敏感内容在被替换前就已经捕获
-- 适配 DeepSeek 自有 SSE 格式（fragments）
+DeepSeek 反代（双通道模式）
+- 主通道：addInitScript 网络拦截，实时逐 chunk 捕获 SSE
+- 备用通道：等复制按钮出现后一次性读 DOM（selenium 思路）
+- 主通道优先（抗审查），备用通道兜底（抗拦截失败）
 """
 
 import os
@@ -21,52 +20,44 @@ from typing import AsyncGenerator, Optional
 from auth_handler import AuthHandler
 
 
-# 注入到页面最早期的 JS 脚本
 INIT_INTERCEPT_SCRIPT = """
 (() => {
-    // 防止重复注入
     if (window.__ds_interceptor_installed) return;
     window.__ds_interceptor_installed = true;
 
-    // 全局捕获存储
     window.__ds_chunks = [];
     window.__ds_stream_done = false;
     window.__ds_stream_error = null;
     window.__ds_capture_active = false;
+    window.__ds_raw_events = [];
 
-    // 重置函数
     window.__ds_reset = () => {
         window.__ds_chunks = [];
         window.__ds_stream_done = false;
         window.__ds_stream_error = null;
+        window.__ds_raw_events = [];
     };
 
-    // 解析 SSE 行，支持 DeepSeek 自有格式和 OpenAI 格式
-    function parseSSELine(line) {
-        line = line.trim();
-        if (!line.startsWith('data: ')) return null;
-        const dataStr = line.substring(6).trim();
-
-        if (dataStr === '[DONE]') return { type: 'done' };
-
+    function extractContent(dataStr) {
         try {
             const parsed = JSON.parse(dataStr);
 
-            // DeepSeek 自有格式：v.response.fragments[].content
+            // DeepSeek 格式：fragments 里面有 content
             if (parsed.v && parsed.v.response) {
-                const resp = parsed.v.response;
-                const fragments = resp.fragments || [];
+                const fragments = parsed.v.response.fragments || [];
                 let text = '';
                 for (const frag of fragments) {
-                    if (frag.content) text += frag.content;
+                    if (frag.content !== undefined && frag.content !== null) {
+                        text += frag.content;
+                    }
                 }
-                if (text) return { type: 'content', data: text, format: 'deepseek' };
+                return { type: 'deepseek', text: text };
             }
 
-            // OpenAI 格式：choices[0].delta.content
+            // OpenAI 格式
             if (parsed.choices && parsed.choices.length > 0) {
                 const delta = parsed.choices[0].delta || {};
-                if (delta.content) return { type: 'content', data: delta.content, format: 'openai' };
+                if (delta.content) return { type: 'openai', text: delta.content };
             }
 
             return null;
@@ -75,8 +66,7 @@ INIT_INTERCEPT_SCRIPT = """
         }
     }
 
-    // 处理 SSE 流的通用函数
-    async function processSSEStream(reader) {
+    async function processStream(reader) {
         const decoder = new TextDecoder();
         let buffer = '';
         let lastFullText = '';
@@ -88,35 +78,35 @@ INIT_INTERCEPT_SCRIPT = """
 
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\\n');
-                buffer = lines.pop(); // 保留不完整行
+                buffer = lines.pop();
 
                 for (const line of lines) {
-                    const result = parseSSELine(line);
-                    if (!result) continue;
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data: ')) continue;
+                    const dataStr = trimmed.substring(6).trim();
 
-                    if (result.type === 'done') {
+                    // 保存原始事件用于调试
+                    if (window.__ds_raw_events.length < 50) {
+                        window.__ds_raw_events.push(dataStr.substring(0, 200));
+                    }
+
+                    if (dataStr === '[DONE]') {
                         window.__ds_stream_done = true;
                         return;
                     }
 
-                    if (result.type === 'content') {
-                        if (result.format === 'deepseek') {
-                            // DeepSeek 格式：每次推送的是完整累积文本
-                            // 我们只取增量部分
-                            const fullText = result.data;
-                            if (fullText.length > lastFullText.length) {
-                                const delta = fullText.substring(lastFullText.length);
-                                window.__ds_chunks.push(delta);
-                                lastFullText = fullText;
-                            } else if (fullText !== lastFullText) {
-                                // 文本被替换了（敏感内容审查），记录完整的新文本
-                                window.__ds_chunks.push('[CONTENT_REPLACED]');
-                                lastFullText = fullText;
-                            }
-                        } else {
-                            // OpenAI 格式：每次是增量
-                            window.__ds_chunks.push(result.data);
+                    const result = extractContent(dataStr);
+                    if (!result) continue;
+
+                    if (result.type === 'deepseek') {
+                        // DeepSeek 每次推送完整累积文本，取增量
+                        if (result.text.length > lastFullText.length) {
+                            const delta = result.text.substring(lastFullText.length);
+                            window.__ds_chunks.push(delta);
+                            lastFullText = result.text;
                         }
+                    } else if (result.type === 'openai') {
+                        window.__ds_chunks.push(result.text);
                     }
                 }
             }
@@ -126,118 +116,101 @@ INIT_INTERCEPT_SCRIPT = """
         window.__ds_stream_done = true;
     }
 
-    // ══════════ 拦截 fetch ══════════
-    const _originalFetch = window.fetch;
+    // ═══ Patch fetch ═══
+    const _origFetch = window.fetch;
     window.fetch = async function(...args) {
-        const response = await _originalFetch.apply(this, args);
+        const resp = await _origFetch.apply(this, args);
         const url = (typeof args[0] === 'string') ? args[0] : (args[0]?.url || '');
 
         if (window.__ds_capture_active && url.includes('/chat/completion')) {
-            const contentType = response.headers.get('content-type') || '';
-            if (contentType.includes('text/event-stream') || contentType.includes('application/json')) {
-                console.log('[DS Intercept] 捕获到 completion 响应');
-                // clone 出来读取，原始返回给页面
-                const cloned = response.clone();
-                const reader = cloned.body.getReader();
-                processSSEStream(reader);
+            const ct = resp.headers.get('content-type') || '';
+            if (ct.includes('text/event-stream') || ct.includes('application/')) {
+                console.log('[DS] fetch 捕获 completion');
+                const cloned = resp.clone();
+                processStream(cloned.body.getReader());
             }
         }
-        return response;
+        return resp;
     };
 
-    // ══════════ 拦截 XMLHttpRequest ══════════
-    const _originalXHROpen = XMLHttpRequest.prototype.open;
-    const _originalXHRSend = XMLHttpRequest.prototype.send;
+    // ═══ Patch XHR ═══
+    const _origOpen = XMLHttpRequest.prototype.open;
+    const _origSend = XMLHttpRequest.prototype.send;
 
     XMLHttpRequest.prototype.open = function(method, url, ...rest) {
         this.__ds_url = url;
-        return _originalXHROpen.call(this, method, url, ...rest);
+        return _origOpen.call(this, method, url, ...rest);
     };
 
     XMLHttpRequest.prototype.send = function(body) {
-        if (window.__ds_capture_active && this.__ds_url && this.__ds_url.includes('/chat/completion')) {
-            console.log('[DS Intercept] XHR 捕获到 completion 请求');
-            let xhrBuffer = '';
-            let xhrLastFullText = '';
+        if (window.__ds_capture_active && this.__ds_url &&
+            this.__ds_url.includes('/chat/completion')) {
+            console.log('[DS] XHR 捕获 completion');
+            let xhrBuf = '';
+            let xhrLast = '';
 
             this.addEventListener('progress', function() {
                 try {
-                    const text = this.responseText || '';
-                    const newData = text.substring(xhrBuffer.length);
-                    xhrBuffer = text;
+                    const newData = (this.responseText || '').substring(xhrBuf.length);
+                    xhrBuf = this.responseText || '';
 
-                    const lines = newData.split('\\n');
-                    for (const line of lines) {
-                        const result = parseSSELine(line);
-                        if (!result) continue;
+                    for (const line of newData.split('\\n')) {
+                        const t = line.trim();
+                        if (!t.startsWith('data: ')) continue;
+                        const ds = t.substring(6).trim();
+                        if (ds === '[DONE]') { window.__ds_stream_done = true; return; }
 
-                        if (result.type === 'done') {
-                            window.__ds_stream_done = true;
-                            return;
-                        }
-
-                        if (result.type === 'content') {
-                            if (result.format === 'deepseek') {
-                                const fullText = result.data;
-                                if (fullText.length > xhrLastFullText.length) {
-                                    window.__ds_chunks.push(fullText.substring(xhrLastFullText.length));
-                                    xhrLastFullText = fullText;
-                                }
-                            } else {
-                                window.__ds_chunks.push(result.data);
+                        const r = extractContent(ds);
+                        if (!r) continue;
+                        if (r.type === 'deepseek') {
+                            if (r.text.length > xhrLast.length) {
+                                window.__ds_chunks.push(r.text.substring(xhrLast.length));
+                                xhrLast = r.text;
                             }
+                        } else {
+                            window.__ds_chunks.push(r.text);
                         }
                     }
-                } catch (e) {}
+                } catch(e) {}
             });
-
-            this.addEventListener('loadend', function() {
-                window.__ds_stream_done = true;
-            });
-
-            this.addEventListener('error', function() {
+            this.addEventListener('loadend', () => { window.__ds_stream_done = true; });
+            this.addEventListener('error', () => {
                 window.__ds_stream_error = 'XHR error';
                 window.__ds_stream_done = true;
             });
         }
-        return _originalXHRSend.call(this, body);
+        return _origSend.call(this, body);
     };
 
-    // ══════════ 拦截 EventSource ══════════
-    const _OriginalEventSource = window.EventSource;
-    if (_OriginalEventSource) {
-        window.EventSource = function(url, config) {
-            const es = new _OriginalEventSource(url, config);
+    // ═══ Patch EventSource ═══
+    const _OrigES = window.EventSource;
+    if (_OrigES) {
+        window.EventSource = function(url, cfg) {
+            const es = new _OrigES(url, cfg);
             if (window.__ds_capture_active && url.includes('/chat/completion')) {
-                console.log('[DS Intercept] EventSource 捕获');
-                let esLastFullText = '';
-
-                es.addEventListener('message', function(event) {
-                    const result = parseSSELine('data: ' + event.data);
-                    if (!result) return;
-                    if (result.type === 'done') { window.__ds_stream_done = true; return; }
-                    if (result.type === 'content') {
-                        if (result.format === 'deepseek') {
-                            if (result.data.length > esLastFullText.length) {
-                                window.__ds_chunks.push(result.data.substring(esLastFullText.length));
-                                esLastFullText = result.data;
-                            }
-                        } else {
-                            window.__ds_chunks.push(result.data);
+                console.log('[DS] EventSource 捕获');
+                let esLast = '';
+                es.addEventListener('message', function(ev) {
+                    if (ev.data === '[DONE]') { window.__ds_stream_done = true; return; }
+                    const r = extractContent(ev.data);
+                    if (!r) return;
+                    if (r.type === 'deepseek') {
+                        if (r.text.length > esLast.length) {
+                            window.__ds_chunks.push(r.text.substring(esLast.length));
+                            esLast = r.text;
                         }
+                    } else {
+                        window.__ds_chunks.push(r.text);
                     }
                 });
                 es.addEventListener('error', () => { window.__ds_stream_done = true; });
             }
             return es;
         };
-        window.EventSource.prototype = _OriginalEventSource.prototype;
-        Object.defineProperty(window.EventSource, 'CONNECTING', { value: 0 });
-        Object.defineProperty(window.EventSource, 'OPEN', { value: 1 });
-        Object.defineProperty(window.EventSource, 'CLOSED', { value: 2 });
+        window.EventSource.prototype = _OrigES.prototype;
     }
 
-    console.log('[DS Intercept] 全协议拦截器已安装 (fetch + XHR + EventSource)');
+    console.log('[DS] 全协议拦截器已安装');
 })();
 """
 
@@ -263,8 +236,6 @@ class BrowserManager:
         self._ready = False
         self._ready_event = asyncio.Event()
 
-    # ── 就绪控制 ──
-
     async def wait_until_ready(self, timeout: float = 180.0) -> bool:
         try:
             await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
@@ -275,8 +246,6 @@ class BrowserManager:
     @property
     def is_ready(self) -> bool:
         return self._ready
-
-    # ── Camoufox 缓存 ──
 
     def _prepare_camoufox_cache(self):
         home_cache = Path.home() / ".cache"
@@ -301,8 +270,6 @@ class BrowserManager:
                 shutil.copytree(cache_dir, store_dir, dirs_exist_ok=True)
             except Exception:
                 pass
-
-    # ── 初始化 ──
 
     async def initialize(self):
         print("🔧 正在初始化浏览器...")
@@ -333,7 +300,6 @@ class BrowserManager:
 
         await self._inject_stealth_scripts()
 
-        # 登录
         auth = AuthHandler(self.page, context=self.context)
         self.logged_in = await auth.login(self.email, self.password)
 
@@ -344,10 +310,9 @@ class BrowserManager:
 
         self._ready = True
         self._ready_event.set()
-        print(f"✅ 就绪（引擎: {self._engine}，模式: 初始化脚本拦截）")
+        print(f"✅ 就绪（引擎: {self._engine}，双通道模式）")
 
     async def _start_with_camoufox(self):
-        print("  → Camoufox...")
         from camoufox.async_api import AsyncCamoufox
         self._camoufox = AsyncCamoufox(headless=self.headless, geoip=False)
         self.browser = await self._camoufox.__aenter__()
@@ -356,13 +321,11 @@ class BrowserManager:
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
         )
-        # 在创建页面之前就注入拦截脚本
         await self.context.add_init_script(INIT_INTERCEPT_SCRIPT)
         self.page = await self.context.new_page()
-        print("  ✅ Camoufox 已启动（拦截器已预注入）")
+        print("  ✅ Camoufox 已启动")
 
     async def _start_with_playwright(self):
-        print("  → Playwright Firefox...")
         from playwright.async_api import async_playwright
         self.playwright = await async_playwright().start()
 
@@ -389,10 +352,9 @@ class BrowserManager:
                 "Gecko/20100101 Firefox/126.0"
             ),
         )
-        # 在创建页面之前就注入拦截脚本
         await self.context.add_init_script(INIT_INTERCEPT_SCRIPT)
         self.page = await self.context.new_page()
-        print("  ✅ Playwright Firefox 已启动（拦截器已预注入）")
+        print("  ✅ Playwright Firefox 已启动")
 
     async def _inject_stealth_scripts(self):
         if self._engine == "camoufox":
@@ -408,22 +370,17 @@ class BrowserManager:
                 });
             """)
 
-    async def _ensure_interceptor_active(self):
-        """确保拦截器在当前页面中仍然有效"""
+    async def _ensure_interceptor(self):
         try:
-            installed = await self.page.evaluate(
-                "() => window.__ds_interceptor_installed === true"
-            )
-            if not installed:
-                print("  ⚠️ 拦截器丢失，重新注入...")
+            ok = await self.page.evaluate("() => window.__ds_interceptor_installed === true")
+            if not ok:
+                print("  ⚠️ 拦截器丢失，重新注入")
                 await self.page.evaluate(INIT_INTERCEPT_SCRIPT)
         except Exception:
             try:
                 await self.page.evaluate(INIT_INTERCEPT_SCRIPT)
             except Exception as e:
-                print(f"  ❌ 重新注入拦截器失败: {e}")
-
-    # ── 新对话 ──
+                print(f"  ❌ 注入失败: {e}")
 
     async def _start_new_chat(self):
         if "chat.deepseek.com" not in self.page.url:
@@ -434,14 +391,13 @@ class BrowserManager:
             )
             await asyncio.sleep(2)
 
-        selectors = [
+        for sel in [
             "xpath=//*[contains(text(), '开启新对话')]",
             "xpath=//*[contains(text(), '新对话')]",
             "xpath=//*[contains(text(), 'New chat')]",
             "div.ds-icon-button",
             "[class*='new-chat']",
-        ]
-        for sel in selectors:
+        ]:
             try:
                 btn = self.page.locator(sel).first
                 if await btn.is_visible(timeout=2000):
@@ -458,8 +414,6 @@ class BrowserManager:
             timeout=30000,
         )
         await asyncio.sleep(3)
-
-    # ── 输入并发送 ──
 
     async def _type_and_send(self, message: str):
         textarea = self.page.locator(
@@ -528,14 +482,11 @@ class BrowserManager:
                 return
 
             try:
-                # 开启新对话
                 await self._start_new_chat()
                 await asyncio.sleep(1)
+                await self._ensure_interceptor()
 
-                # 确保拦截器有效
-                await self._ensure_interceptor_active()
-
-                # 重置捕获状态 + 开启捕获
+                # 重置 + 开启捕获
                 await self.page.evaluate("""
                     () => {
                         window.__ds_reset();
@@ -543,89 +494,139 @@ class BrowserManager:
                     }
                 """)
 
-                # 发送消息
                 await self._type_and_send(message)
 
-                # ── 实时轮询读取 ──
-                print(f"  [{req_id}] 等待 SSE 流...")
+                # ═══ 双通道并行读取 ═══
+                print(f"  [{req_id}] 双通道等待...")
+
                 full_text = ""
                 read_index = 0
                 max_wait = 600.0
                 waited = 0.0
                 idle_count = 0
                 stream_started = False
+                network_has_data = False
 
                 while waited < max_wait:
+                    # ── 通道1：网络拦截 ──
                     result = await self.page.evaluate("""
                         (fromIndex) => ({
                             chunks: window.__ds_chunks.slice(fromIndex),
                             total: window.__ds_chunks.length,
                             done: window.__ds_stream_done,
                             error: window.__ds_stream_error,
+                            rawCount: window.__ds_raw_events.length,
+                            rawSample: window.__ds_raw_events.slice(0, 3),
                         })
                     """, read_index)
 
                     if result.get("error"):
-                        err = result["error"]
-                        print(f"  [{req_id}] ❌ 流错误: {err}")
-                        if not full_text:
-                            yield f"[错误] {err}"
+                        print(f"  [{req_id}] ❌ 网络层错误: {result['error']}")
                         break
 
                     new_chunks = result.get("chunks", [])
                     if new_chunks:
                         if not stream_started:
                             stream_started = True
-                            print(f"  [{req_id}] 流开始")
+                            network_has_data = True
+                            print(f"  [{req_id}] 🌐 网络通道流开始")
 
                         for chunk in new_chunks:
                             if chunk == '[CONTENT_REPLACED]':
-                                print(f"  [{req_id}] ⚠️ 检测到内容被替换（审查）")
+                                print(f"  [{req_id}] ⚠️ 内容被审查替换")
                                 continue
                             full_text += chunk
                             yield chunk
                         read_index += len(new_chunks)
                         idle_count = 0
 
-                    if result.get("done"):
-                        if not new_chunks:
-                            break
-                        continue
+                    if result.get("done") and not new_chunks:
+                        if network_has_data:
+                            print(f"  [{req_id}] 🌐 网络通道完成")
+                        break
 
+                    # ── 通道2：DOM 备用（复制按钮检测）──
                     if not new_chunks:
                         idle_count += 1
+
+                        # 每隔一段时间检查复制按钮
+                        if idle_count % 10 == 0:
+                            dom_status = await self.page.evaluate("""
+                                () => {
+                                    const items = document.querySelectorAll(
+                                        'div[data-virtual-list-item-key]'
+                                    );
+                                    if (items.length === 0) return { ready: false };
+                                    const last = items[items.length - 1];
+                                    const btns = last.querySelectorAll('div[role="button"]');
+                                    const md = last.querySelectorAll('[class*="ds-markdown"]');
+                                    const text = md.length > 0
+                                        ? md[md.length - 1].textContent || ''
+                                        : '';
+                                    return {
+                                        ready: btns.length > 0,
+                                        textLen: text.length,
+                                        hasText: text.length > 0,
+                                    };
+                                }
+                            """)
+
+                            if dom_status.get("ready") and dom_status.get("hasText"):
+                                if not network_has_data:
+                                    # 网络通道完全没数据，用 DOM
+                                    print(f"  [{req_id}] 📋 网络通道无数据，切换 DOM 通道")
+                                    dom_text = await self._read_dom_response()
+                                    if dom_text:
+                                        full_text = dom_text
+                                        yield dom_text
+                                    break
+                                else:
+                                    # 网络通道有数据但已停止，检查 DOM 是否有更多
+                                    if idle_count > 20:
+                                        break
 
                     sleep_time = 0.05 if idle_count < 50 else 0.2
                     await asyncio.sleep(sleep_time)
                     waited += sleep_time
 
-                    # 超时检查
+                    # 长时间无数据
+                    if not stream_started and waited > 30:
+                        # 30秒了，打印调试信息
+                        if idle_count % 50 == 0:
+                            raw_count = result.get("rawCount", 0)
+                            raw_sample = result.get("rawSample", [])
+                            print(f"  [{req_id}] ⏳ 等待中 waited={waited:.0f}s "
+                                  f"rawEvents={raw_count}")
+                            if raw_sample:
+                                for s in raw_sample:
+                                    print(f"    raw: {s[:150]}")
+
                     if not stream_started and waited > 90:
-                        print(f"  [{req_id}] ⚠️ 90秒未收到流数据，尝试 DOM 兜底")
-                        fallback = await self._dom_fallback()
-                        if fallback:
-                            yield fallback
-                            full_text = fallback
+                        print(f"  [{req_id}] ⚠️ 90s 无网络数据，尝试 DOM")
+                        dom_text = await self._read_dom_response()
+                        if dom_text:
+                            full_text = dom_text
+                            yield dom_text
                         else:
-                            yield "[错误] 等待响应超时"
+                            yield "[错误] 响应超时"
                         break
 
-                    if idle_count > 0 and idle_count % 200 == 0:
-                        print(f"  [{req_id}] ⏳ idle={idle_count}, waited={waited:.0f}s")
-
                 # 关闭捕获
-                await self.page.evaluate(
-                    "() => { window.__ds_capture_active = false; }"
-                )
+                try:
+                    await self.page.evaluate(
+                        "() => { window.__ds_capture_active = false; }"
+                    )
+                except Exception:
+                    pass
 
                 # 最终兜底
                 if not full_text:
                     await asyncio.sleep(2)
-                    fallback = await self._dom_fallback()
-                    if fallback:
-                        print(f"  [{req_id}] 🔄 DOM 兜底，长度: {len(fallback)}")
-                        yield fallback
-                        full_text = fallback
+                    dom_text = await self._read_dom_response()
+                    if dom_text:
+                        print(f"  [{req_id}] 📋 最终 DOM 兜底，长度: {len(dom_text)}")
+                        yield dom_text
+                        full_text = dom_text
 
                 print(f"  [{req_id}] ✅ 完成，长度: {len(full_text)}")
 
@@ -641,7 +642,8 @@ class BrowserManager:
                 traceback.print_exc()
                 yield f"[错误] {str(e)}"
 
-    async def _dom_fallback(self) -> str:
+    async def _read_dom_response(self) -> str:
+        """Selenium 思路：从最后一个对话项的 ds-markdown 读取文本"""
         try:
             text = await self.page.evaluate("""
                 () => {
@@ -664,8 +666,6 @@ class BrowserManager:
         except Exception:
             return ""
 
-    # ── 其他 ──
-
     async def is_alive(self) -> bool:
         try:
             if not self._ready or not self.page or self.page.is_closed():
@@ -682,7 +682,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "init-script-intercept",
+            "mode": "dual-channel",
             "has_token": True,
             "cookie_count": 0,
             "uptime_seconds": time.time() - self.start_time,
@@ -713,8 +713,7 @@ class BrowserManager:
             self.heartbeat_count += 1
             import random
             await self.page.mouse.move(
-                random.randint(100, 1800),
-                random.randint(100, 900),
+                random.randint(100, 1800), random.randint(100, 900)
             )
             await self.page.evaluate("""
                 () => {
