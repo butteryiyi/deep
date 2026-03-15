@@ -1,10 +1,10 @@
 # browser_manager.py
 """
-DeepSeek 反代（网络拦截模式）
-- 通过 DOM 输入消息、点击发送
-- 通过拦截浏览器网络请求的 SSE 响应来读取回复
-- PoW 由浏览器自己处理，代码完全不涉及
-- 不受虚拟列表 DOM 回收影响，一个 token 都不丢
+DeepSeek 反代（路由拦截模式）
+- 用 Playwright route API 做中间人，拦截所有 /chat/completion 请求
+- 读取真实响应后同时转发给页面和推入队列
+- 不依赖 fetch monkey-patch，不受 Worker/XHR/EventSource 限制
+- PoW 由浏览器自己处理
 """
 
 import os
@@ -38,16 +38,13 @@ class BrowserManager:
         self.headless = os.getenv("HEADLESS", "true").lower() == "true"
         self._engine = "unknown"
 
-        # 请求锁
         self._lock = asyncio.Lock()
-
-        # 就绪控制
         self._ready = False
         self._ready_event = asyncio.Event()
 
-        # SSE 流捕获队列（每次请求一个新的）
+        # SSE 捕获
         self._sse_queue: asyncio.Queue = None
-        self._active_response_handler = None
+        self._capture_active = False
 
     # ── 就绪控制 ──
 
@@ -72,9 +69,8 @@ class BrowserManager:
             try:
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(store_dir, cache_dir, dirs_exist_ok=True)
-                print(f"  ✅ Camoufox 缓存已恢复")
-            except Exception as e:
-                print(f"  ⚠️ 恢复缓存失败: {e}")
+            except Exception:
+                pass
         else:
             store_dir.mkdir(parents=True, exist_ok=True)
 
@@ -129,12 +125,12 @@ class BrowserManager:
         else:
             print("🎉 登录成功！")
 
-        # 注册网络响应拦截器（核心）
-        self._setup_response_interceptor()
+        # 注册路由拦截器
+        await self._setup_route_interceptor()
 
         self._ready = True
         self._ready_event.set()
-        print(f"✅ 就绪（引擎: {self._engine}，模式: 网络拦截，无 PoW）")
+        print(f"✅ 就绪（引擎: {self._engine}，模式: 路由拦截）")
 
     async def _start_with_camoufox(self):
         print("  → Camoufox...")
@@ -195,56 +191,83 @@ class BrowserManager:
             """)
 
     # ══════════════════════════════════════════════════════
-    # 核心：网络响应拦截器
+    # 核心：Playwright route 拦截器
     # ══════════════════════════════════════════════════════
 
-    def _setup_response_interceptor(self):
+    async def _setup_route_interceptor(self):
         """
-        监听浏览器发出的所有网络响应。
-        当检测到 /chat/completion 的 SSE 流响应时，
-        在 JS 层用 ReadableStream 逐块读取并推入队列。
+        用 page.route 拦截 /chat/completion 请求。
+        拿到真实响应后：
+        1. 解析 SSE 内容推入队列
+        2. 把完整响应原样转发回页面（页面正常工作）
         """
-        self.page.on("response", self._on_response)
-        print("  🔌 网络响应拦截器已注册")
+        async def handle_completion_route(route):
+            """拦截 /chat/completion 请求"""
+            if not self._capture_active:
+                # 不在捕获模式，直接放行
+                await route.continue_()
+                return
 
-    async def _on_response(self, response):
-        """Playwright response 事件回调"""
-        url = response.url
-        # 只拦截聊天完成的 SSE 流
-        if "/chat/completion" not in url:
-            return
-        if response.status != 200:
-            return
+            print("  🎯 拦截到 /chat/completion 请求")
 
-        # 检查是否是 SSE
-        content_type = response.headers.get("content-type", "")
-        if "text/event-stream" not in content_type:
-            return
+            try:
+                # 获取真实响应
+                response = await route.fetch()
+                status = response.status
+                headers = response.headers
+                body_bytes = await response.body()
 
-        print(f"  🎯 捕获到 SSE 响应: {url[:80]}")
+                # 把响应原样返回给页面
+                await route.fulfill(
+                    status=status,
+                    headers=headers,
+                    body=body_bytes,
+                )
 
-        # 读取完整响应体，解析 SSE
-        try:
-            body = await response.text()
-            self._parse_sse_body(body)
-        except Exception as e:
-            print(f"  ⚠️ 读取 SSE 响应失败: {e}")
-            if self._sse_queue:
-                await self._sse_queue.put({"type": "error", "data": str(e)})
-                await self._sse_queue.put({"type": "done"})
+                # 同时解析 SSE 内容推入队列
+                if status == 200 and self._sse_queue:
+                    body_text = body_bytes.decode("utf-8", errors="replace")
+                    self._parse_sse_to_queue(body_text)
+                elif self._sse_queue:
+                    body_text = body_bytes.decode("utf-8", errors="replace")
+                    print(f"  ⚠️ 响应状态码: {status}, body: {body_text[:200]}")
+                    await self._sse_queue.put({
+                        "type": "error",
+                        "data": f"HTTP {status}: {body_text[:500]}"
+                    })
+                    await self._sse_queue.put({"type": "done"})
 
-    def _parse_sse_body(self, body: str):
-        """解析 SSE 响应体，将内容推入队列"""
+            except Exception as e:
+                print(f"  ❌ 路由拦截异常: {e}")
+                # 出错时放行原始请求，避免页面卡死
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+                if self._sse_queue:
+                    await self._sse_queue.put({
+                        "type": "error",
+                        "data": str(e)
+                    })
+                    await self._sse_queue.put({"type": "done"})
+
+        # 注册路由：匹配所有包含 /chat/completion 的 URL
+        await self.page.route("**/chat/completion*", handle_completion_route)
+        print("  🔌 路由拦截器已注册")
+
+    def _parse_sse_to_queue(self, body: str):
+        """解析 SSE 文本，把内容逐条推入队列"""
         if not self._sse_queue:
             return
 
-        loop = asyncio.get_event_loop()
         lines = body.split("\n")
+        has_content = False
 
         for line in lines:
             line = line.strip()
             if not line.startswith("data: "):
                 continue
+
             data_str = line[6:].strip()
 
             if data_str == "[DONE]":
@@ -258,114 +281,22 @@ class BrowserManager:
                     delta = choices[0].get("delta", {})
                     content = delta.get("content", "")
                     if content:
+                        has_content = True
                         asyncio.ensure_future(
-                            self._sse_queue.put({"type": "content", "data": content})
+                            self._sse_queue.put({
+                                "type": "content",
+                                "data": content
+                            })
                         )
             except json.JSONDecodeError:
                 pass
 
-        # 如果没有遇到 [DONE]，也标记结束
+        # 兜底：确保队列一定有结束信号
         asyncio.ensure_future(self._sse_queue.put({"type": "done"}))
 
-    # ══════════════════════════════════════════════════════
-    # 备用方案：通过 JS 层面拦截 fetch 响应
-    # （某些情况下 Playwright response 事件无法获取流式 body）
-    # ══════════════════════════════════════════════════════
-
-    async def _setup_js_fetch_interceptor(self):
-        """
-        在页面中注入 fetch 拦截器。
-        monkey-patch window.fetch，当检测到 /chat/completion 请求时，
-        clone 响应并逐块读取推入全局数组。
-        """
-        await self.page.evaluate("""
-            () => {
-                if (window.__ds_fetch_patched) return;
-                window.__ds_fetch_patched = true;
-
-                // 全局存储捕获的 SSE 数据
-                window.__ds_sse_chunks = [];
-                window.__ds_sse_done = false;
-                window.__ds_sse_error = null;
-
-                const originalFetch = window.fetch;
-                window.fetch = async function(...args) {
-                    const response = await originalFetch.apply(this, args);
-                    const url = (typeof args[0] === 'string') ? args[0] : args[0]?.url || '';
-
-                    if (url.includes('/chat/completion')) {
-                        const contentType = response.headers.get('content-type') || '';
-                        if (contentType.includes('text/event-stream')) {
-                            // 重置
-                            window.__ds_sse_chunks = [];
-                            window.__ds_sse_done = false;
-                            window.__ds_sse_error = null;
-
-                            // clone 响应，原始响应正常返回给页面
-                            const cloned = response.clone();
-
-                            // 异步读取 clone 的流
-                            (async () => {
-                                try {
-                                    const reader = cloned.body.getReader();
-                                    const decoder = new TextDecoder();
-                                    let buffer = '';
-
-                                    while (true) {
-                                        const { done, value } = await reader.read();
-                                        if (done) break;
-
-                                        buffer += decoder.decode(value, { stream: true });
-                                        const lines = buffer.split('\\n');
-                                        buffer = lines.pop(); // 保留不完整的最后一行
-
-                                        for (const line of lines) {
-                                            const trimmed = line.trim();
-                                            if (!trimmed.startsWith('data: ')) continue;
-                                            const dataStr = trimmed.substring(6).trim();
-
-                                            if (dataStr === '[DONE]') {
-                                                window.__ds_sse_done = true;
-                                                return;
-                                            }
-
-                                            try {
-                                                const parsed = JSON.parse(dataStr);
-                                                const choices = parsed.choices || [];
-                                                if (choices.length > 0) {
-                                                    const content = choices[0]?.delta?.content || '';
-                                                    if (content) {
-                                                        window.__ds_sse_chunks.push(content);
-                                                    }
-                                                }
-                                            } catch (e) {}
-                                        }
-                                    }
-                                    window.__ds_sse_done = true;
-                                } catch (e) {
-                                    window.__ds_sse_error = e.message;
-                                    window.__ds_sse_done = true;
-                                }
-                            })();
-                        }
-                    }
-                    return response;
-                };
-                console.log('[DS] fetch 拦截器已注入');
-            }
-        """)
-        print("  🔌 JS fetch 拦截器已注入")
-
-    async def _ensure_js_interceptor(self):
-        """确保 JS 拦截器仍然有效"""
-        try:
-            patched = await self.page.evaluate(
-                "() => window.__ds_fetch_patched === true"
-            )
-            if not patched:
-                await self._setup_js_fetch_interceptor()
-        except Exception:
-            await self._setup_js_fetch_interceptor()
+        if not has_content:
+            print(f"  ⚠️ SSE 解析完成但无内容，body 长度: {len(body)}")
+            print(f"  ⚠️ body 预览: {body[:500]}")
 
     # ── 新对话 ──
 
@@ -445,7 +376,7 @@ class BrowserManager:
         await asyncio.sleep(1)
 
     # ══════════════════════════════════════════════════════
-    # 核心发送方法
+    # 核心发送
     # ══════════════════════════════════════════════════════
 
     async def send_message(self, message: str) -> str:
@@ -472,143 +403,112 @@ class BrowserManager:
                 return
 
             try:
-                # 准备：注入 JS 拦截器 + 开启新对话
-                await self._ensure_js_interceptor()
+                # 开启新对话
                 await self._start_new_chat()
                 await asyncio.sleep(1)
-                await self._ensure_js_interceptor()
 
-                # 重置 JS 层的 SSE 捕获状态
-                await self.page.evaluate("""
-                    () => {
-                        window.__ds_sse_chunks = [];
-                        window.__ds_sse_done = false;
-                        window.__ds_sse_error = null;
-                    }
-                """)
-
-                # 同时准备 Playwright 层的队列
+                # 准备队列，开启捕获
                 self._sse_queue = asyncio.Queue()
+                self._capture_active = True
 
                 # 发送消息
                 await self._type_and_send(message)
 
-                # ── 从两个来源竞争读取 SSE 数据 ──
-                # 优先使用 JS 拦截器（更可靠），Playwright response 事件作为备用
+                # ── 从队列读取 SSE 数据 ──
                 print(f"  [{req_id}] 等待 SSE 流...")
-
                 full_text = ""
-                read_index = 0
-                max_wait = 600.0  # 10分钟
-                waited = 0.0
-                idle_count = 0
+                max_wait = 600.0
                 stream_started = False
 
-                while waited < max_wait:
-                    # 从 JS 层读取
-                    result = await self.page.evaluate("""
-                        (fromIndex) => {
-                            return {
-                                chunks: window.__ds_sse_chunks.slice(fromIndex),
-                                total: window.__ds_sse_chunks.length,
-                                done: window.__ds_sse_done,
-                                error: window.__ds_sse_error,
-                            };
-                        }
-                    """, read_index)
-
-                    if result.get("error"):
-                        err = result["error"]
-                        print(f"  [{req_id}] ❌ SSE 错误: {err}")
-                        if not full_text:
-                            yield f"[错误] {err}"
+                while True:
+                    try:
+                        # 等待队列中的消息，超时则检查状态
+                        msg = await asyncio.wait_for(
+                            self._sse_queue.get(),
+                            timeout=120.0 if not stream_started else 60.0
+                        )
+                    except asyncio.TimeoutError:
+                        if not stream_started:
+                            print(f"  [{req_id}] ⚠️ 120秒未收到 SSE 数据")
+                            # DOM 兜底
+                            fallback = await self._dom_fallback()
+                            if fallback:
+                                print(f"  [{req_id}] 🔄 DOM 兜底成功，长度: {len(fallback)}")
+                                yield fallback
+                                full_text = fallback
+                            else:
+                                yield "[错误] 等待响应超时，请重试"
+                        else:
+                            print(f"  [{req_id}] ⚠️ 流中断（60秒无新数据）")
                         break
 
-                    new_chunks = result.get("chunks", [])
-                    if new_chunks:
+                    if msg["type"] == "content":
                         if not stream_started:
                             stream_started = True
                             print(f"  [{req_id}] 流开始")
+                        full_text += msg["data"]
+                        yield msg["data"]
 
-                        for chunk in new_chunks:
-                            full_text += chunk
-                            yield chunk
-                        read_index += len(new_chunks)
-                        idle_count = 0
-
-                    if result.get("done"):
-                        if not new_chunks:
-                            break
-                        continue
-
-                    if not new_chunks:
-                        idle_count += 1
-
-                        # 如果 JS 拦截器没数据，尝试从 Playwright 队列读
-                        if not self._sse_queue.empty():
-                            try:
-                                msg = self._sse_queue.get_nowait()
-                                if msg["type"] == "content":
-                                    if not stream_started:
-                                        stream_started = True
-                                        print(f"  [{req_id}] 流开始 (PW)")
-                                    full_text += msg["data"]
-                                    yield msg["data"]
-                                    idle_count = 0
-                                elif msg["type"] == "done":
-                                    break
-                                elif msg["type"] == "error":
-                                    if not full_text:
-                                        yield f"[错误] {msg['data']}"
-                                    break
-                            except asyncio.QueueEmpty:
-                                pass
-
-                    sleep_time = 0.1 if idle_count < 50 else 0.3
-                    await asyncio.sleep(sleep_time)
-                    waited += sleep_time
-
-                    # 超时检查
-                    if not stream_started and waited > 60:
-                        print(f"  [{req_id}] ⚠️ 60秒未收到流数据")
-                        # 尝试 DOM 兜底
-                        fallback = await self._dom_fallback()
-                        if fallback:
-                            yield fallback
-                        else:
-                            yield "[错误] 等待响应超时"
+                    elif msg["type"] == "done":
                         break
 
-                    if idle_count > 0 and idle_count % 100 == 0:
-                        print(f"  [{req_id}] ⏳ idle={idle_count}")
+                    elif msg["type"] == "error":
+                        err = msg["data"]
+                        print(f"  [{req_id}] ❌ SSE 错误: {err}")
+                        if not full_text:
+                            # 尝试 DOM 兜底
+                            fallback = await self._dom_fallback()
+                            if fallback:
+                                yield fallback
+                                full_text = fallback
+                            else:
+                                yield f"[错误] {err}"
+                        break
 
-                # 清理
+                # 关闭捕获
+                self._capture_active = False
                 self._sse_queue = None
+
+                # 如果完全没内容，最终 DOM 兜底
+                if not full_text:
+                    await asyncio.sleep(3)
+                    fallback = await self._dom_fallback()
+                    if fallback:
+                        print(f"  [{req_id}] 🔄 最终 DOM 兜底，长度: {len(fallback)}")
+                        yield fallback
+                        full_text = fallback
+
                 print(f"  [{req_id}] ✅ 完成，长度: {len(full_text)}")
 
             except Exception as e:
+                self._capture_active = False
+                self._sse_queue = None
                 print(f"  [{req_id}] ❌ {e}")
                 import traceback
                 traceback.print_exc()
                 yield f"[错误] {str(e)}"
 
     async def _dom_fallback(self) -> str:
-        """DOM 兜底：万一网络拦截失败，从 DOM 读取"""
+        """DOM 兜底"""
         try:
             text = await self.page.evaluate("""
                 () => {
+                    // 方法1: DeepSeek 虚拟列表
                     const items = document.querySelectorAll(
                         'div[data-virtual-list-item-key]'
                     );
                     if (items.length > 0) {
                         const last = items[items.length - 1];
                         const md = last.querySelectorAll('[class*="ds-markdown"]');
-                        if (md.length > 0)
+                        if (md.length > 0) {
                             return md[md.length - 1].textContent || '';
+                        }
                     }
+                    // 方法2: 通用
                     const allMd = document.querySelectorAll('[class*="ds-markdown"]');
-                    if (allMd.length > 0)
+                    if (allMd.length > 0) {
                         return allMd[allMd.length - 1].textContent || '';
+                    }
                     return '';
                 }
             """)
@@ -616,7 +516,7 @@ class BrowserManager:
         except Exception:
             return ""
 
-    # ── 其他方法 ──
+    # ── 其他 ──
 
     async def is_alive(self) -> bool:
         try:
@@ -634,7 +534,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "network-intercept",
+            "mode": "route-intercept",
             "has_token": True,
             "cookie_count": 0,
             "uptime_seconds": time.time() - self.start_time,
