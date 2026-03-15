@@ -1,8 +1,10 @@
 # browser_manager.py
 """
-DeepSeek 反代（DOM 交互模式）
-- 合并旧版（DOM 交互 + Camoufox + 请求锁）与新版（就绪控制 + 辅助脚本预注入）
-- 不涉及 PoW，所有反爬由浏览器自己处理
+DeepSeek 反代（网络拦截模式）
+- 通过 DOM 输入消息、点击发送
+- 通过拦截浏览器网络请求的 SSE 响应来读取回复
+- PoW 由浏览器自己处理，代码完全不涉及
+- 不受虚拟列表 DOM 回收影响，一个 token 都不丢
 """
 
 import os
@@ -36,12 +38,16 @@ class BrowserManager:
         self.headless = os.getenv("HEADLESS", "true").lower() == "true"
         self._engine = "unknown"
 
-        # 请求锁：保证同时只有一个对话在进行
+        # 请求锁
         self._lock = asyncio.Lock()
 
         # 就绪控制
         self._ready = False
         self._ready_event = asyncio.Event()
+
+        # SSE 流捕获队列（每次请求一个新的）
+        self._sse_queue: asyncio.Queue = None
+        self._active_response_handler = None
 
     # ── 就绪控制 ──
 
@@ -56,48 +62,32 @@ class BrowserManager:
     def is_ready(self) -> bool:
         return self._ready
 
-    # ── Camoufox 缓存管理 ──
+    # ── Camoufox 缓存 ──
 
     def _prepare_camoufox_cache(self):
         home_cache = Path.home() / ".cache"
         store_dir = home_cache / "camoufox_store"
         cache_dir = home_cache / "camoufox"
-
         if store_dir.exists() and any(store_dir.iterdir()):
-            print(f"  📦 从持久存储恢复 Camoufox 缓存...")
             try:
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(store_dir, cache_dir, dirs_exist_ok=True)
-                print(f"  ✅ 缓存已恢复，大小: {self._dir_size(cache_dir):.0f} MB")
+                print(f"  ✅ Camoufox 缓存已恢复")
             except Exception as e:
                 print(f"  ⚠️ 恢复缓存失败: {e}")
         else:
-            print(f"  📦 未找到持久缓存，Camoufox 将首次下载...")
             store_dir.mkdir(parents=True, exist_ok=True)
 
     def _save_camoufox_cache(self):
         home_cache = Path.home() / ".cache"
         store_dir = home_cache / "camoufox_store"
         cache_dir = home_cache / "camoufox"
-
         if cache_dir.exists() and any(cache_dir.iterdir()):
             try:
                 store_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(cache_dir, store_dir, dirs_exist_ok=True)
-                print(f"  💾 Camoufox 缓存已保存 ({self._dir_size(store_dir):.0f} MB)")
-            except Exception as e:
-                print(f"  ⚠️ 保存缓存失败（非致命）: {e}")
-
-    @staticmethod
-    def _dir_size(path: Path) -> float:
-        total = 0
-        try:
-            for f in path.rglob("*"):
-                if f.is_file():
-                    total += f.stat().st_size
-        except Exception:
-            pass
-        return total / (1024 * 1024)
+            except Exception:
+                pass
 
     # ── 初始化 ──
 
@@ -108,26 +98,21 @@ class BrowserManager:
             if os.path.isdir("/opt/browsers"):
                 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/browsers"
 
-        # 优先尝试 Camoufox，失败则回退 Playwright Firefox
         camoufox_ok = False
         try:
             os.environ['CAMOUFOX_NO_UPDATE_CHECK'] = '1'
             self._prepare_camoufox_cache()
-            from camoufox.async_api import AsyncCamoufox
-            self._camoufox_cls = AsyncCamoufox
             await self._start_with_camoufox()
             camoufox_ok = True
             self._engine = "camoufox"
             self._save_camoufox_cache()
         except Exception as e:
-            print(f"⚠️ Camoufox 启动失败: {e}")
-            print("⚠️ 回退到 Playwright Firefox...")
+            print(f"⚠️ Camoufox 失败: {e}，回退 Playwright Firefox")
             if hasattr(self, '_camoufox'):
                 try:
                     await self._camoufox.__aexit__(None, None, None)
                 except Exception:
                     pass
-            camoufox_ok = False
 
         if not camoufox_ok:
             await self._start_with_playwright()
@@ -140,22 +125,20 @@ class BrowserManager:
         self.logged_in = await auth.login(self.email, self.password)
 
         if not self.logged_in:
-            print("⚠️ 登录可能未完成，请检查 /screenshot 端点。")
+            print("⚠️ 登录可能未完成")
         else:
             print("🎉 登录成功！")
 
-        # 注入 DOM 辅助脚本
-        await self._inject_helper_scripts()
+        # 注册网络响应拦截器（核心）
+        self._setup_response_interceptor()
 
-        # 标记就绪
         self._ready = True
         self._ready_event.set()
-        print(f"✅ 浏览器就绪（引擎: {self._engine}，模式: DOM 交互，无 PoW）")
+        print(f"✅ 就绪（引擎: {self._engine}，模式: 网络拦截，无 PoW）")
 
     async def _start_with_camoufox(self):
-        print("  → 使用 Camoufox 反指纹浏览器...")
+        print("  → Camoufox...")
         from camoufox.async_api import AsyncCamoufox
-
         self._camoufox = AsyncCamoufox(headless=self.headless, geoip=False)
         self.browser = await self._camoufox.__aenter__()
         self.context = await self.browser.new_context(
@@ -164,10 +147,10 @@ class BrowserManager:
             timezone_id="Asia/Shanghai",
         )
         self.page = await self.context.new_page()
-        print("  ✅ Camoufox 浏览器已启动。")
+        print("  ✅ Camoufox 已启动")
 
     async def _start_with_playwright(self):
-        print("  → 使用 Playwright Firefox...")
+        print("  → Playwright Firefox...")
         from playwright.async_api import async_playwright
         self.playwright = await async_playwright().start()
 
@@ -177,13 +160,10 @@ class BrowserManager:
             )
         except Exception:
             import subprocess
-            env = os.environ.copy()
-            result = subprocess.run(
+            subprocess.run(
                 [sys.executable, "-m", "playwright", "install", "firefox"],
-                capture_output=True, text=True, env=env, timeout=120,
+                capture_output=True, text=True, timeout=120,
             )
-            if result.returncode != 0:
-                raise RuntimeError(f"Playwright Firefox 安装失败: {result.stderr}")
             self.browser = await self.playwright.firefox.launch(
                 headless=self.headless, args=["--no-sandbox"]
             )
@@ -198,117 +178,198 @@ class BrowserManager:
             ),
         )
         self.page = await self.context.new_page()
-        print("  ✅ Playwright Firefox 已启动。")
+        print("  ✅ Playwright Firefox 已启动")
 
     async def _inject_stealth_scripts(self):
         if self._engine == "camoufox":
             await self.context.add_init_script(
-                "if (navigator.webdriver !== undefined) {"
-                "  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-                "}"
+                "if(navigator.webdriver!==undefined)"
+                "{Object.defineProperty(navigator,'webdriver',{get:()=>undefined})}"
             )
-            print("  🛡️ Camoufox: 最小化反检测脚本")
         else:
             await self.context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['zh-CN', 'zh', 'en-US', 'en']
+                Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+                Object.defineProperty(navigator,'languages',{
+                    get:()=>['zh-CN','zh','en-US','en']
                 });
-                const _origQuery = window.navigator.permissions.query;
-                if (_origQuery) {
-                    window.navigator.permissions.query = (p) => (
-                        p.name === 'notifications'
-                            ? Promise.resolve({ state: Notification.permission })
-                            : _origQuery(p)
-                    );
-                }
             """)
-            print("  🛡️ Firefox: 注入反检测脚本")
 
-    async def _inject_helper_scripts(self):
-        """注入 DOM 辅助脚本，用于高效提取回复和检测状态"""
+    # ══════════════════════════════════════════════════════
+    # 核心：网络响应拦截器
+    # ══════════════════════════════════════════════════════
+
+    def _setup_response_interceptor(self):
+        """
+        监听浏览器发出的所有网络响应。
+        当检测到 /chat/completion 的 SSE 流响应时，
+        在 JS 层用 ReadableStream 逐块读取并推入队列。
+        """
+        self.page.on("response", self._on_response)
+        print("  🔌 网络响应拦截器已注册")
+
+    async def _on_response(self, response):
+        """Playwright response 事件回调"""
+        url = response.url
+        # 只拦截聊天完成的 SSE 流
+        if "/chat/completion" not in url:
+            return
+        if response.status != 200:
+            return
+
+        # 检查是否是 SSE
+        content_type = response.headers.get("content-type", "")
+        if "text/event-stream" not in content_type:
+            return
+
+        print(f"  🎯 捕获到 SSE 响应: {url[:80]}")
+
+        # 读取完整响应体，解析 SSE
+        try:
+            body = await response.text()
+            self._parse_sse_body(body)
+        except Exception as e:
+            print(f"  ⚠️ 读取 SSE 响应失败: {e}")
+            if self._sse_queue:
+                await self._sse_queue.put({"type": "error", "data": str(e)})
+                await self._sse_queue.put({"type": "done"})
+
+    def _parse_sse_body(self, body: str):
+        """解析 SSE 响应体，将内容推入队列"""
+        if not self._sse_queue:
+            return
+
+        loop = asyncio.get_event_loop()
+        lines = body.split("\n")
+
+        for line in lines:
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:].strip()
+
+            if data_str == "[DONE]":
+                asyncio.ensure_future(self._sse_queue.put({"type": "done"}))
+                return
+
+            try:
+                parsed = json.loads(data_str)
+                choices = parsed.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        asyncio.ensure_future(
+                            self._sse_queue.put({"type": "content", "data": content})
+                        )
+            except json.JSONDecodeError:
+                pass
+
+        # 如果没有遇到 [DONE]，也标记结束
+        asyncio.ensure_future(self._sse_queue.put({"type": "done"}))
+
+    # ══════════════════════════════════════════════════════
+    # 备用方案：通过 JS 层面拦截 fetch 响应
+    # （某些情况下 Playwright response 事件无法获取流式 body）
+    # ══════════════════════════════════════════════════════
+
+    async def _setup_js_fetch_interceptor(self):
+        """
+        在页面中注入 fetch 拦截器。
+        monkey-patch window.fetch，当检测到 /chat/completion 请求时，
+        clone 响应并逐块读取推入全局数组。
+        """
         await self.page.evaluate("""
             () => {
-                window.__ds_injected = true;
+                if (window.__ds_fetch_patched) return;
+                window.__ds_fetch_patched = true;
 
-                // 获取最后一条回复的文本
-                window.__ds_get_last_reply = () => {
-                    // 方法1：通过 data-virtual-list-item-key 定位（DeepSeek 特有）
-                    const items = document.querySelectorAll('div[data-virtual-list-item-key]');
-                    if (items.length > 0) {
-                        const lastItem = items[items.length - 1];
-                        const mdEls = lastItem.querySelectorAll('[class*="ds-markdown"]');
-                        if (mdEls.length > 0) {
-                            return mdEls[mdEls.length - 1].textContent || '';
+                // 全局存储捕获的 SSE 数据
+                window.__ds_sse_chunks = [];
+                window.__ds_sse_done = false;
+                window.__ds_sse_error = null;
+
+                const originalFetch = window.fetch;
+                window.fetch = async function(...args) {
+                    const response = await originalFetch.apply(this, args);
+                    const url = (typeof args[0] === 'string') ? args[0] : args[0]?.url || '';
+
+                    if (url.includes('/chat/completion')) {
+                        const contentType = response.headers.get('content-type') || '';
+                        if (contentType.includes('text/event-stream')) {
+                            // 重置
+                            window.__ds_sse_chunks = [];
+                            window.__ds_sse_done = false;
+                            window.__ds_sse_error = null;
+
+                            // clone 响应，原始响应正常返回给页面
+                            const cloned = response.clone();
+
+                            // 异步读取 clone 的流
+                            (async () => {
+                                try {
+                                    const reader = cloned.body.getReader();
+                                    const decoder = new TextDecoder();
+                                    let buffer = '';
+
+                                    while (true) {
+                                        const { done, value } = await reader.read();
+                                        if (done) break;
+
+                                        buffer += decoder.decode(value, { stream: true });
+                                        const lines = buffer.split('\\n');
+                                        buffer = lines.pop(); // 保留不完整的最后一行
+
+                                        for (const line of lines) {
+                                            const trimmed = line.trim();
+                                            if (!trimmed.startsWith('data: ')) continue;
+                                            const dataStr = trimmed.substring(6).trim();
+
+                                            if (dataStr === '[DONE]') {
+                                                window.__ds_sse_done = true;
+                                                return;
+                                            }
+
+                                            try {
+                                                const parsed = JSON.parse(dataStr);
+                                                const choices = parsed.choices || [];
+                                                if (choices.length > 0) {
+                                                    const content = choices[0]?.delta?.content || '';
+                                                    if (content) {
+                                                        window.__ds_sse_chunks.push(content);
+                                                    }
+                                                }
+                                            } catch (e) {}
+                                        }
+                                    }
+                                    window.__ds_sse_done = true;
+                                } catch (e) {
+                                    window.__ds_sse_error = e.message;
+                                    window.__ds_sse_done = true;
+                                }
+                            })();
                         }
                     }
-
-                    // 方法2：通用 markdown 容器
-                    const allMd = document.querySelectorAll(
-                        '.ds-markdown--block, .ds-markdown, [class*="markdown"]'
-                    );
-                    if (allMd.length > 0) {
-                        return allMd[allMd.length - 1].textContent || '';
-                    }
-                    return '';
+                    return response;
                 };
-
-                // 综合检测是否正在生成
-                window.__ds_is_generating = () => {
-                    // 停止按钮存在
-                    const stops = document.querySelectorAll(
-                        '[class*="stop"], [class*="square"], [aria-label*="stop"], [aria-label*="Stop"]'
-                    );
-                    for (const el of stops) {
-                        if (el.offsetParent !== null) return true;
-                    }
-
-                    // loading 动画
-                    const loaders = document.querySelectorAll(
-                        '[class*="loading"], [class*="typing"], [class*="generating"]'
-                    );
-                    for (const el of loaders) {
-                        if (el.offsetParent !== null) return true;
-                    }
-
-                    return false;
-                };
-
-                // 检查复制按钮是否出现（回复完成的可靠标志）
-                window.__ds_has_copy_button = () => {
-                    const items = document.querySelectorAll('div[data-virtual-list-item-key]');
-                    if (items.length === 0) return false;
-                    const lastItem = items[items.length - 1];
-                    const buttons = lastItem.querySelectorAll('div[role="button"]');
-                    return buttons.length > 0;
-                };
-
-                // 回复数量
-                window.__ds_reply_count = () => {
-                    return document.querySelectorAll('div[data-virtual-list-item-key]').length;
-                };
-
-                console.log('[DS Helper] 辅助脚本注入完成');
+                console.log('[DS] fetch 拦截器已注入');
             }
         """)
-        print("  📜 DOM 辅助脚本已注入")
+        print("  🔌 JS fetch 拦截器已注入")
 
-    async def _ensure_helper_injected(self):
-        """确保辅助脚本仍然有效（页面刷新后会丢失）"""
+    async def _ensure_js_interceptor(self):
+        """确保 JS 拦截器仍然有效"""
         try:
-            injected = await self.page.evaluate("() => window.__ds_injected === true")
-            if not injected:
-                await self._inject_helper_scripts()
+            patched = await self.page.evaluate(
+                "() => window.__ds_fetch_patched === true"
+            )
+            if not patched:
+                await self._setup_js_fetch_interceptor()
         except Exception:
-            await self._inject_helper_scripts()
+            await self._setup_js_fetch_interceptor()
 
     # ── 新对话 ──
 
     async def _start_new_chat(self):
-        """开启新对话，确保上下文干净"""
-        print("  → 开启新对话...")
-
-        # 确保在 DeepSeek 页面
         if "chat.deepseek.com" not in self.page.url:
             await self.page.goto(
                 "https://chat.deepseek.com/",
@@ -317,43 +378,34 @@ class BrowserManager:
             )
             await asyncio.sleep(2)
 
-        # 尝试点击"开启新对话"
         selectors = [
             "xpath=//*[contains(text(), '开启新对话')]",
             "xpath=//*[contains(text(), '新对话')]",
             "xpath=//*[contains(text(), 'New chat')]",
-            "xpath=//*[contains(text(), 'New Chat')]",
             "div.ds-icon-button",
             "[class*='new-chat']",
-            "[class*='new_chat']",
         ]
-
         for sel in selectors:
             try:
                 btn = self.page.locator(sel).first
                 if await btn.is_visible(timeout=2000):
                     await btn.click()
                     await asyncio.sleep(1)
-                    print("  ✅ 已开启新对话")
-                    return True
+                    print("  ✅ 新对话")
+                    return
             except Exception:
                 continue
 
-        # 都失败则导航到主页
         await self.page.goto(
             "https://chat.deepseek.com/",
             wait_until="domcontentloaded",
             timeout=30000,
         )
         await asyncio.sleep(3)
-        print("  ✅ 已导航到新对话页面")
-        return True
 
     # ── 输入并发送 ──
 
     async def _type_and_send(self, message: str):
-        """定位输入框，输入消息，发送"""
-        # 等待输入框
         textarea = self.page.locator(
             "textarea[placeholder*='DeepSeek'], "
             "textarea[placeholder*='发送消息'], "
@@ -364,13 +416,11 @@ class BrowserManager:
         await textarea.click()
         await asyncio.sleep(0.3)
 
-        # 先尝试 fill（模拟粘贴，速度快），失败则用 JS 注入
         try:
             await textarea.fill("")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
             await textarea.fill(message)
         except Exception:
-            # fill 失败，用 JS 直接设值
             await self.page.evaluate("""
                 (text) => {
                     const el = document.querySelector('textarea')
@@ -382,7 +432,6 @@ class BrowserManager:
                         ).set;
                         setter.call(el, text);
                         el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
                     } else {
                         el.innerText = text;
                         el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -391,14 +440,13 @@ class BrowserManager:
             """, message)
 
         await asyncio.sleep(0.5)
-        print(f"  → 已输入消息，长度: {len(message)}")
-
-        # 发送：先尝试 Enter，因为 DeepSeek 默认 Enter 发送
         await textarea.press("Enter")
-        print("  → 消息已发送")
-        await asyncio.sleep(2)
+        print(f"  → 已发送 ({len(message)} 字符)")
+        await asyncio.sleep(1)
 
-    # ── 核心发送方法 ──
+    # ══════════════════════════════════════════════════════
+    # 核心发送方法
+    # ══════════════════════════════════════════════════════
 
     async def send_message(self, message: str) -> str:
         full = ""
@@ -407,156 +455,136 @@ class BrowserManager:
         return full
 
     async def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
-        """
-        发送消息并流式返回响应。
-        
-        合并两版优点：
-        - 旧版的完成检测（复制按钮 + 停止按钮 + stable_count）
-        - 新版的就绪控制和辅助脚本预注入
-        """
-        # 等待就绪
         if not self._ready:
-            print("  ⏳ 请求等待浏览器初始化完成...")
             ok = await self.wait_until_ready(timeout=180)
             if not ok:
-                yield "[错误] 浏览器初始化超时，请稍后重试"
+                yield "[错误] 浏览器初始化超时"
                 return
 
-        # 加锁
         async with self._lock:
             self.total_requests += 1
             self.requests_handled += 1
             req_id = self.total_requests
             print(f"📨 请求 #{req_id} (长度: {len(message)} 字符)")
-            print(f"  → 预览: {message[:100]}...")
 
             if not self.page:
                 yield "[错误] 浏览器未就绪"
                 return
 
             try:
-                # 确保辅助脚本有效
-                await self._ensure_helper_injected()
-
-                # 开启新对话
+                # 准备：注入 JS 拦截器 + 开启新对话
+                await self._ensure_js_interceptor()
                 await self._start_new_chat()
                 await asyncio.sleep(1)
+                await self._ensure_js_interceptor()
 
-                # 再次确保辅助脚本（新对话可能导致页面变化）
-                await self._ensure_helper_injected()
+                # 重置 JS 层的 SSE 捕获状态
+                await self.page.evaluate("""
+                    () => {
+                        window.__ds_sse_chunks = [];
+                        window.__ds_sse_done = false;
+                        window.__ds_sse_error = null;
+                    }
+                """)
 
-                # 记录发送前的回复数量
-                reply_count_before = await self.page.evaluate(
-                    "() => window.__ds_reply_count()"
-                )
+                # 同时准备 Playwright 层的队列
+                self._sse_queue = asyncio.Queue()
 
-                # 输入并发送
+                # 发送消息
                 await self._type_and_send(message)
 
-                # ── 等待回复出现 ──
-                print(f"  [{req_id}] 等待回复...")
-                last_text = ""
-                stable_count = 0
-                max_wait_seconds = 600  # 最多等10分钟
-                response_started = False
+                # ── 从两个来源竞争读取 SSE 数据 ──
+                # 优先使用 JS 拦截器（更可靠），Playwright response 事件作为备用
+                print(f"  [{req_id}] 等待 SSE 流...")
 
-                for tick in range(max_wait_seconds * 2):  # 每0.5秒一次
-                    await asyncio.sleep(0.5)
+                full_text = ""
+                read_index = 0
+                max_wait = 600.0  # 10分钟
+                waited = 0.0
+                idle_count = 0
+                stream_started = False
 
-                    try:
-                        current_text = await self.page.evaluate(
-                            "() => window.__ds_get_last_reply()"
-                        )
-                        is_generating = await self.page.evaluate(
-                            "() => window.__ds_is_generating()"
-                        )
-                        has_copy_btn = await self.page.evaluate(
-                            "() => window.__ds_has_copy_button()"
-                        )
-                        current_count = await self.page.evaluate(
-                            "() => window.__ds_reply_count()"
-                        )
-                    except Exception:
-                        # 页面可能刷新了，重新注入
-                        await self._ensure_helper_injected()
-                        continue
-
-                    current_text = (current_text or "").strip()
-
-                    # 检测回复开始
-                    if not response_started:
-                        if current_text and current_count > reply_count_before:
-                            response_started = True
-                            print(f"  [{req_id}] 回复开始")
-                        elif is_generating:
-                            response_started = True
-                            print(f"  [{req_id}] 检测到生成中")
-                        elif tick > 120:  # 60秒还没开始
-                            print(f"  [{req_id}] ❌ 等待回复超时（60秒）")
-                            yield "[错误] 等待回复超时"
-                            return
-                        continue
-
-                    # 回复已开始，流式输出
-                    if current_text and len(current_text) > len(last_text):
-                        new_part = current_text[len(last_text):]
-                        last_text = current_text
-                        stable_count = 0
-                        yield new_part
-                    elif current_text == last_text:
-                        stable_count += 1
-
-                    # 完成检测（三重保障）
-                    # 1. 复制按钮出现 + 不在生成 + 文本稳定
-                    if has_copy_btn and not is_generating and stable_count >= 3:
-                        print(f"  [{req_id}] ✅ 完成（复制按钮可用）")
-                        break
-
-                    # 2. 不在生成 + 有内容 + 文本稳定较长时间
-                    if not is_generating and current_text and stable_count >= 10:
-                        print(f"  [{req_id}] ✅ 完成（生成停止 + 文本稳定）")
-                        break
-
-                    # 3. 文本超长时间无变化
-                    if stable_count >= 60:  # 30秒无变化
-                        print(f"  [{req_id}] ⏹️ 超时（文本30秒无变化）")
-                        break
-
-                    # 进度日志
-                    if tick > 0 and tick % 20 == 0:
-                        print(
-                            f"  [{req_id}] ⏳ tick={tick}, "
-                            f"len={len(current_text)}, "
-                            f"gen={is_generating}, "
-                            f"copy={has_copy_btn}, "
-                            f"stable={stable_count}"
-                        )
-
-                # ── 兜底：如果完全没有获取到内容 ──
-                if not last_text:
-                    fallback = await self.page.evaluate("""
-                        () => {
-                            const allMd = document.querySelectorAll('[class*="ds-markdown"]');
-                            if (allMd.length > 0) {
-                                return allMd[allMd.length - 1].textContent || '';
-                            }
-                            return '';
+                while waited < max_wait:
+                    # 从 JS 层读取
+                    result = await self.page.evaluate("""
+                        (fromIndex) => {
+                            return {
+                                chunks: window.__ds_sse_chunks.slice(fromIndex),
+                                total: window.__ds_sse_chunks.length,
+                                done: window.__ds_sse_done,
+                                error: window.__ds_sse_error,
+                            };
                         }
-                    """)
-                    if fallback and fallback.strip():
-                        print(f"  [{req_id}] ⚠️ 兜底获取回复，长度: {len(fallback)}")
-                        yield fallback.strip()
-                    else:
-                        print(f"  [{req_id}] ❌ 完全未获取到响应")
-                        try:
-                            ss = await self.take_screenshot_base64()
-                            if ss:
-                                print(f"  [{req_id}] 📸 调试截图已生成")
-                        except Exception:
-                            pass
-                        yield "抱歉，未能获取到响应。请稍后重试。"
+                    """, read_index)
 
-                print(f"  [{req_id}] 📊 最终长度: {len(last_text)} 字符")
+                    if result.get("error"):
+                        err = result["error"]
+                        print(f"  [{req_id}] ❌ SSE 错误: {err}")
+                        if not full_text:
+                            yield f"[错误] {err}"
+                        break
+
+                    new_chunks = result.get("chunks", [])
+                    if new_chunks:
+                        if not stream_started:
+                            stream_started = True
+                            print(f"  [{req_id}] 流开始")
+
+                        for chunk in new_chunks:
+                            full_text += chunk
+                            yield chunk
+                        read_index += len(new_chunks)
+                        idle_count = 0
+
+                    if result.get("done"):
+                        if not new_chunks:
+                            break
+                        continue
+
+                    if not new_chunks:
+                        idle_count += 1
+
+                        # 如果 JS 拦截器没数据，尝试从 Playwright 队列读
+                        if not self._sse_queue.empty():
+                            try:
+                                msg = self._sse_queue.get_nowait()
+                                if msg["type"] == "content":
+                                    if not stream_started:
+                                        stream_started = True
+                                        print(f"  [{req_id}] 流开始 (PW)")
+                                    full_text += msg["data"]
+                                    yield msg["data"]
+                                    idle_count = 0
+                                elif msg["type"] == "done":
+                                    break
+                                elif msg["type"] == "error":
+                                    if not full_text:
+                                        yield f"[错误] {msg['data']}"
+                                    break
+                            except asyncio.QueueEmpty:
+                                pass
+
+                    sleep_time = 0.1 if idle_count < 50 else 0.3
+                    await asyncio.sleep(sleep_time)
+                    waited += sleep_time
+
+                    # 超时检查
+                    if not stream_started and waited > 60:
+                        print(f"  [{req_id}] ⚠️ 60秒未收到流数据")
+                        # 尝试 DOM 兜底
+                        fallback = await self._dom_fallback()
+                        if fallback:
+                            yield fallback
+                        else:
+                            yield "[错误] 等待响应超时"
+                        break
+
+                    if idle_count > 0 and idle_count % 100 == 0:
+                        print(f"  [{req_id}] ⏳ idle={idle_count}")
+
+                # 清理
+                self._sse_queue = None
+                print(f"  [{req_id}] ✅ 完成，长度: {len(full_text)}")
 
             except Exception as e:
                 print(f"  [{req_id}] ❌ {e}")
@@ -564,7 +592,31 @@ class BrowserManager:
                 traceback.print_exc()
                 yield f"[错误] {str(e)}"
 
-    # ── 其他 ──
+    async def _dom_fallback(self) -> str:
+        """DOM 兜底：万一网络拦截失败，从 DOM 读取"""
+        try:
+            text = await self.page.evaluate("""
+                () => {
+                    const items = document.querySelectorAll(
+                        'div[data-virtual-list-item-key]'
+                    );
+                    if (items.length > 0) {
+                        const last = items[items.length - 1];
+                        const md = last.querySelectorAll('[class*="ds-markdown"]');
+                        if (md.length > 0)
+                            return md[md.length - 1].textContent || '';
+                    }
+                    const allMd = document.querySelectorAll('[class*="ds-markdown"]');
+                    if (allMd.length > 0)
+                        return allMd[allMd.length - 1].textContent || '';
+                    return '';
+                }
+            """)
+            return (text or "").strip()
+        except Exception:
+            return ""
+
+    # ── 其他方法 ──
 
     async def is_alive(self) -> bool:
         try:
@@ -582,14 +634,18 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "dom-interaction",
+            "mode": "network-intercept",
+            "has_token": True,
+            "cookie_count": 0,
             "uptime_seconds": time.time() - self.start_time,
             "heartbeat_count": self.heartbeat_count,
             "requests_handled": self.requests_handled,
             "total_requests": self.total_requests,
-            "has_token": True,
-            "cookie_count": 0,
-            "current_url": self.page.url if self.page and not self.page.is_closed() else "N/A",
+            "current_url": (
+                self.page.url
+                if self.page and not self.page.is_closed()
+                else "N/A"
+            ),
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -599,8 +655,7 @@ class BrowserManager:
                 return None
             buf = await self.page.screenshot(full_page=False)
             return base64.b64encode(buf).decode("utf-8")
-        except Exception as e:
-            print(f"❌ 截图失败: {e}")
+        except Exception:
             return None
 
     async def simulate_activity(self):
@@ -609,9 +664,10 @@ class BrowserManager:
         try:
             self.heartbeat_count += 1
             import random
-            x = random.randint(100, 1800)
-            y = random.randint(100, 900)
-            await self.page.mouse.move(x, y)
+            await self.page.mouse.move(
+                random.randint(100, 1800),
+                random.randint(100, 900),
+            )
             await self.page.evaluate("""
                 () => {
                     document.dispatchEvent(new MouseEvent('mousemove', {
@@ -619,7 +675,6 @@ class BrowserManager:
                         clientY: Math.random() * window.innerHeight
                     }));
                     window.scrollBy(0, Math.random() > 0.5 ? 1 : -1);
-                    window.dispatchEvent(new Event('focus'));
                 }
             """)
             if self.heartbeat_count % 10 == 0:
@@ -629,14 +684,13 @@ class BrowserManager:
 
     async def shutdown(self):
         try:
-            if hasattr(self, '_save_camoufox_cache'):
-                self._save_camoufox_cache()
+            self._save_camoufox_cache()
             if self.context:
                 await self.context.close()
             if self.browser:
                 await self.browser.close()
             if self.playwright:
                 await self.playwright.stop()
-            print("🔒 浏览器已安全关闭。")
+            print("🔒 已关闭")
         except Exception as e:
-            print(f"⚠️ 关闭浏览器时出错: {e}")
+            print(f"⚠️ {e}")
