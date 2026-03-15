@@ -1,63 +1,33 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# 安装系统依赖（包括浏览器运行所需库）
+# 系统依赖（Camoufox/Firefox 需要的库）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    curl \
-    gnupg \
-    procps \
-    xvfb \
-    libdbus-glib-1-2 \
-    libgtk-3-0 \
-    libx11-xcb1 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libxkbcommon0 \
-    libasound2 \
-    libxss1 \
-    libxtst6 \
-    libxi6 \
-    libnss3 \
-    libxcursor1 \
-    libgdk-pixbuf-2.0-0 \
-    && apt-get clean \
+    wget curl gnupg \
+    libgtk-3-0 libdbus-glib-1-2 libxt6 libx11-xcb1 \
+    libasound2 libxcomposite1 libxdamage1 libxrandr2 \
+    libgbm1 libpango-1.0-0 libcairo2 libatk1.0-0 \
+    libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+    libxshmfence1 fonts-noto-cjk xvfb \
     && rm -rf /var/lib/apt/lists/*
-
-# 创建非 root 用户
-RUN useradd -m -u 1000 app_user
 
 WORKDIR /app
 
-# 复制 requirements.txt 并安装 Python 依赖
+# 先复制 requirements.txt 利用 Docker 缓存
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# ===== 关键修改：使用 camoufox fetch 预下载浏览器 =====
-# 创建缓存目录并设置权限
-RUN mkdir -p /home/app_user/.cache && chown -R app_user:app_user /home/app_user/.cache
+# ========== 关键：构建时就预装 Camoufox ==========
+RUN python -c "from camoufox.pkgman import install_camoufox; install_camoufox()"
 
-# 切换到 app_user 运行 fetch 命令
-USER app_user
-ENV CAMOUFOX_NO_UPDATE_CHECK=1
-# 运行 fetch 命令下载浏览器到 ~/.cache/camoufox
-RUN python -c "from camoufox.sync_api import CamoufoxSync; CamoufoxSync.fetch()" || echo "Camoufox fetch failed, will retry at runtime"
+# 同时预装 Playwright Firefox 作为后备
+RUN python -m playwright install firefox && python -m playwright install-deps firefox
 
-# 切换回 root 复制应用代码
-USER root
-COPY --chown=app_user:app_user . .
+# 复制应用代码
+COPY . .
 
-# 预安装 Playwright Firefox 作为后备（可选）
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
-RUN python -m playwright install firefox && chown -R app_user:app_user /opt/browsers
+# Render 会设置 PORT 环境变量
+ENV PORT=10000
+EXPOSE 10000
 
-# 最终以 app_user 运行
-USER app_user
-
-EXPOSE 7860
+# 启动命令
 CMD ["python", "app.py"]
