@@ -1,10 +1,9 @@
 # browser_manager.py
 """
 DeepSeek 反代（多页面并发 + DOM 通道）
-- 一个浏览器开 N 个标签页，每个页面独立会话
-- 请求进来自动分配到空闲页面
-- 通过等待复制按钮出现来判断回复完成（Selenium 验证过的方案）
-- 从 ds-markdown DOM 元素读取完整回复
+- 多标签页并发
+- DOM 轮询读取回复
+- 正确处理内容审查替换
 """
 
 import os
@@ -102,10 +101,6 @@ class ChatPage:
         await asyncio.sleep(1)
 
     async def get_response_state(self) -> dict:
-        """
-        获取当前页面的回复状态。
-        与 Selenium 版本完全对齐的选择器逻辑。
-        """
         return await self.page.evaluate("""
             () => {
                 const items = document.querySelectorAll(
@@ -122,7 +117,6 @@ class ChatPage:
 
                 const lastItem = items[items.length - 1];
 
-                // 获取最后一个 ds-markdown 的文本
                 const mdEls = lastItem.querySelectorAll(
                     '[class*="ds-markdown"]'
                 );
@@ -131,13 +125,11 @@ class ChatPage:
                     text = mdEls[mdEls.length - 1].textContent || '';
                 }
 
-                // 复制按钮是否可用（回复完成的标志）
                 const buttons = lastItem.querySelectorAll(
                     'div[role="button"]'
                 );
                 const hasButton = buttons.length > 0;
 
-                // 是否正在生成
                 const stopBtn = document.querySelector(
                     '[class*="stop"], [class*="square"]'
                 );
@@ -154,7 +146,6 @@ class ChatPage:
         """)
 
     async def read_dom_response(self) -> str:
-        """兜底：直接读取最后一个 ds-markdown"""
         try:
             text = await self.page.evaluate("""
                 () => {
@@ -207,7 +198,6 @@ class BrowserManager:
         self.headless = os.getenv("HEADLESS", "true").lower() == "true"
         self._engine = "unknown"
 
-        # 页面池
         self._page_count = int(os.getenv("PAGE_COUNT", "3"))
         self._pages: list[ChatPage] = []
         self._page_semaphore: asyncio.Semaphore = None
@@ -279,7 +269,6 @@ class BrowserManager:
 
         await self._inject_stealth_scripts()
 
-        # 用第一个页面登录
         first_page = await self.context.new_page()
         auth = AuthHandler(first_page, context=self.context)
         self.logged_in = await auth.login(self.email, self.password)
@@ -292,7 +281,6 @@ class BrowserManager:
             self._pages.append(ChatPage(first_page, 0))
             print(f"  📄 页面 #0 就绪")
 
-        # 创建更多页面（共享 context = 共享登录态）
         for i in range(1, self._page_count):
             try:
                 page = await self.context.new_page()
@@ -312,7 +300,7 @@ class BrowserManager:
 
         self._ready = True
         self._ready_event.set()
-        print(f"✅ 就绪（引擎: {self._engine}，{actual_count} 个并发页面，DOM 模式）")
+        print(f"✅ 就绪（引擎: {self._engine}，{actual_count} 个并发页面）")
 
     async def _start_with_camoufox(self):
         from camoufox.async_api import AsyncCamoufox
@@ -368,10 +356,6 @@ class BrowserManager:
                 });
             """)
 
-    # ══════════════════════════════════════════════════════
-    # 页面池
-    # ══════════════════════════════════════════════════════
-
     async def _acquire_page(self) -> ChatPage:
         await self._page_semaphore.acquire()
         for cp in self._pages:
@@ -392,8 +376,6 @@ class BrowserManager:
         cp.busy = False
         self._page_semaphore.release()
 
-    # ══════════════════════════════════════════════════════
-    # 核心发送
     # ══════════════════════════════════════════════════════
 
     async def send_message(self, message: str) -> str:
@@ -429,7 +411,6 @@ class BrowserManager:
         try:
             cp.request_count += 1
 
-            # 检查页面存活
             if not await cp.is_alive():
                 print(f"  [{req_id}] 页面 #{cp.page_id} 已死，恢复中...")
                 try:
@@ -445,21 +426,22 @@ class BrowserManager:
                     yield f"[错误] 页面恢复失败: {e}"
                     return
 
-            # 开启新对话
             await cp.start_new_chat()
             await asyncio.sleep(1)
-
-            # 输入并发送
             await cp.type_and_send(message)
             print(f"  [{req_id}] 等待回复...")
 
-            # ═══ DOM 通道：轮询等待 ═══
-            last_text = ""
-            stable_count = 0
+            # ═══ DOM 轮询 ═══
+            # 策略：不做流式输出，等复制按钮出现后一次性读取
+            # 这样最稳定，跟 Selenium 版本完全一致
+            # 流式效果在 app.py 层用分块模拟
+
             max_wait_seconds = 600
             response_started = False
+            last_len = 0
+            stable_count = 0
 
-            for tick in range(max_wait_seconds * 2):  # 每 0.5s 一次
+            for tick in range(max_wait_seconds * 2):
                 await asyncio.sleep(0.5)
 
                 try:
@@ -470,36 +452,31 @@ class BrowserManager:
                 current_text = (state.get("text") or "").strip()
                 has_button = state.get("hasButton", False)
                 is_generating = state.get("isGenerating", False)
+                current_len = len(current_text)
 
-                # 检测回复开始
                 if current_text and not response_started:
                     response_started = True
-                    print(f"  [{req_id}] 回复开始 "
-                          f"(items={state.get('itemCount')})")
+                    print(f"  [{req_id}] 回复开始")
 
-                if response_started and current_text:
-                    # 有新增内容，流式输出
-                    if len(current_text) > len(last_text):
-                        new_part = current_text[len(last_text):]
-                        last_text = current_text
+                if response_started:
+                    if current_len != last_len:
+                        # 文本有变化（变长或变短都算）
+                        last_len = current_len
                         stable_count = 0
-                        yield new_part
-                    elif current_text == last_text:
+                    else:
                         stable_count += 1
 
-                    # 完成判定（三重保障）
-                    # 1. 复制按钮出现 + 不在生成 + 稳定3次
+                    # 完成判定：复制按钮出现 + 不在生成 + 文本稳定
                     if has_button and not is_generating and stable_count >= 3:
-                        print(f"  [{req_id}] ✅ 完成（复制按钮可用）")
+                        print(f"  [{req_id}] ✅ 回复完成")
                         break
 
-                    # 2. 不在生成 + 有内容 + 稳定10次
-                    if (not is_generating and current_text
-                            and stable_count >= 10):
-                        print(f"  [{req_id}] ✅ 完成（生成停止+稳定）")
+                    # 备用判定：不在生成 + 文本稳定较长时间
+                    if not is_generating and stable_count >= 10:
+                        print(f"  [{req_id}] ✅ 回复完成（稳定）")
                         break
 
-                    # 3. 文本30秒无变化
+                    # 超长稳定
                     if stable_count >= 60:
                         print(f"  [{req_id}] ⏹️ 超时（30s无变化）")
                         break
@@ -508,37 +485,31 @@ class BrowserManager:
                 if tick > 0 and tick % 20 == 0:
                     print(
                         f"  [{req_id}] ⏳ tick={tick} "
-                        f"len={len(current_text)} "
+                        f"len={current_len} "
                         f"gen={is_generating} "
                         f"btn={has_button} "
                         f"stable={stable_count}"
                     )
 
-                # 完全没有回复的超时
-                if not response_started and tick > 120:  # 60秒
+                if not response_started and tick > 120:
                     print(f"  [{req_id}] ❌ 60秒无回复")
-                    yield "[错误] 等待回复超时"
                     break
 
-            # ═══ 兜底 ═══
-            if not last_text:
-                fallback = await cp.read_dom_response()
-                if fallback:
-                    print(f"  [{req_id}] 📋 兜底获取: {len(fallback)}")
-                    yield fallback
-                    last_text = fallback
-                else:
-                    print(f"  [{req_id}] ❌ 完全无响应")
-                    try:
-                        ss = await self.take_screenshot_base64()
-                        if ss:
-                            print(f"  [{req_id}] 📸 截图已生成")
-                    except Exception:
-                        pass
-                    yield "抱歉，未能获取到响应。请稍后重试。"
+            # ═══ 读取最终文本 ═══
+            final_text = await cp.read_dom_response()
 
-            print(f"  [{req_id}] 📊 页面#{cp.page_id} "
-                  f"完成，长度: {len(last_text)}")
+            if final_text:
+                print(f"  [{req_id}] 📊 最终长度: {len(final_text)}")
+                yield final_text
+            else:
+                print(f"  [{req_id}] ❌ 完全无响应")
+                try:
+                    ss = await self.take_screenshot_base64()
+                    if ss:
+                        print(f"  [{req_id}] 📸 截图已生成")
+                except Exception:
+                    pass
+                yield "抱歉，未能获取到响应。请稍后重试。"
 
         except Exception as e:
             print(f"  [{req_id}] ❌ {e}")
