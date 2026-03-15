@@ -13,7 +13,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
 import uvicorn
 
 from browser_manager import BrowserManager
@@ -24,6 +24,29 @@ from keepalive import KeepaliveService
 # ============================================================
 browser_mgr: BrowserManager = None
 keepalive_svc: KeepaliveService = None
+
+# API 密钥验证
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
+
+
+def verify_api_key(request: Request):
+    """验证 API 密钥（如果设置了 API_SECRET_KEY 环境变量）"""
+    if not API_SECRET_KEY:
+        return  # 未设置密钥则不验证
+
+    # 从 Authorization header 获取
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        if token == API_SECRET_KEY:
+            return
+
+    # 从 query parameter 获取
+    token = request.query_params.get("token", "")
+    if token == API_SECRET_KEY:
+        return
+
+    raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 # ============================================================
@@ -66,6 +89,8 @@ async def initialize_background():
             await keepalive_svc.start()
     except Exception as e:
         print(f"❌ 后台任务：浏览器初始化失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 app = FastAPI(title="DeepSeek Proxy", lifespan=lifespan)
@@ -74,9 +99,13 @@ app = FastAPI(title="DeepSeek Proxy", lifespan=lifespan)
 # ============================================================
 # 健康检查 & 状态页
 # ============================================================
-@app.get("/")
-async def index():
-    """状态仪表盘页面。"""
+@app.api_route("/", methods=["GET", "HEAD"])
+async def index(request: Request):
+    """状态仪表盘页面。支持 GET 和 HEAD（Render 健康检查用 HEAD）。"""
+    # HEAD 请求直接返回 200，不需要 body
+    if request.method == "HEAD":
+        return Response(status_code=200)
+
     status = await browser_mgr.get_status() if browser_mgr else {"status": "initializing"}
     uptime = status.get("uptime_seconds", 0)
     hours, remainder = divmod(int(uptime), 3600)
@@ -113,6 +142,7 @@ async def index():
                 <div><span class="label">登录状态：</span>{"✅ 已登录" if status.get("logged_in") else "❌ 未登录"}</div>
                 <div><span class="label">心跳次数：</span>{status.get("heartbeat_count", 0)}</div>
                 <div><span class="label">处理请求：</span>{status.get("requests_handled", 0)}</div>
+                <div><span class="label">引擎：</span>{status.get("engine", "N/A")}</div>
             </div>
             <p style="color: #8b949e; font-size: 12px;">
                 POST /v1/chat/completions 发送聊天请求<br>
@@ -125,9 +155,11 @@ async def index():
     return HTMLResponse(content=html)
 
 
-@app.get("/health")
-async def health():
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health(request: Request):
     """健康检查端点：只要服务进程活着就返回200，不依赖浏览器状态。"""
+    if request.method == "HEAD":
+        return Response(status_code=200)
     return {"status": "ok"}
 
 
@@ -156,13 +188,9 @@ async def screenshot():
 
 
 # ============================================================
-# 辅助函数：将 messages 数组拼接为完整的上下文字符串
+# 辅助函数
 # ============================================================
 def build_prompt_from_messages(messages: list) -> str:
-    """
-    将 OpenAI 格式的 messages 数组拼接为单个 prompt 字符串。
-    与本地 deepseek_proxy.py 的逻辑完全一致。
-    """
     prompt_parts = []
     prompt_parts.append("请根据以下对话历史和最后一个用户对话，生成对应的回复。")
 
@@ -170,7 +198,6 @@ def build_prompt_from_messages(messages: list) -> str:
         role = message.get("role", "")
         content = message.get("content", "")
 
-        # 处理 content 可能是字符串或列表（多模态）的情况
         processed_content = ""
         if isinstance(content, str):
             processed_content = content
@@ -190,10 +217,9 @@ def build_prompt_from_messages(messages: list) -> str:
 # ============================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """
-    兼容 OpenAI API 格式的聊天端点。
-    接收标准的 messages 数组，将完整上下文拼接后通过浏览器发送给 DeepSeek。
-    """
+    # 验证 API 密钥
+    verify_api_key(request)
+
     if not browser_mgr or not await browser_mgr.is_alive():
         raise HTTPException(status_code=503, detail="浏览器会话未就绪")
 
@@ -208,7 +234,6 @@ async def chat_completions(request: Request):
 
     stream = body.get("stream", False)
 
-    # ====== 关键改动：将完整 messages 拼接为带上下文的 prompt ======
     user_prompt = build_prompt_from_messages(messages)
 
     if not user_prompt:
@@ -232,7 +257,6 @@ async def chat_completions(request: Request):
                 }
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-            # 发送结束标记
             end_data = {
                 "id": f"chatcmpl-{int(time.time()*1000)}",
                 "object": "chat.completion.chunk",
@@ -314,5 +338,5 @@ async def websocket_endpoint(websocket: WebSocket):
 # 入口
 # ============================================================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
