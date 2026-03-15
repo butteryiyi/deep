@@ -2,10 +2,11 @@
 """
 认证处理器（Cookie 注入版）：
 不再模拟输入账号密码，而是直接注入预先获取的 Cookie 和 localStorage。
-支持三种 Cookie 来源：
-1. 环境变量 DEEPSEEK_COOKIES / DEEPSEEK_LOCAL_STORAGE（适合 HF 部署）
-2. 本地文件 deepseek_cookies.json（适合本地开发）
-3. 环境变量 DEEPSEEK_TOKEN（直接注入 API token）
+支持四种 Cookie 来源（按优先级）：
+1. 环境变量 DEEPSEEK_AUTH（★推荐：单个变量包含所有认证数据）
+2. 环境变量 DEEPSEEK_TOKEN（直接注入 API token）
+3. 环境变量 DEEPSEEK_COOKIES / DEEPSEEK_LOCAL_STORAGE
+4. 本地文件 deepseek_cookies.json 或 deepseek_auth.json
 """
 
 import os
@@ -40,9 +41,10 @@ class AuthHandler:
     def _load_auth_data(self) -> dict:
         """
         从多种来源加载认证数据，优先级：
-        1. 环境变量 DEEPSEEK_TOKEN（最简单）
-        2. 环境变量 DEEPSEEK_COOKIES + DEEPSEEK_LOCAL_STORAGE
-        3. 本地文件 deepseek_cookies.json
+        1. 环境变量 DEEPSEEK_AUTH（单个 JSON 变量，包含 cookies + local_storage 等）
+        2. 环境变量 DEEPSEEK_TOKEN（最简单）
+        3. 环境变量 DEEPSEEK_COOKIES + DEEPSEEK_LOCAL_STORAGE
+        4. 本地文件 deepseek_auth.json 或 deepseek_cookies.json
         """
         auth_data = {
             "cookies": [],
@@ -51,14 +53,34 @@ class AuthHandler:
             "token": None,
         }
 
-        # === 来源1：直接 Token ===
+        # === 来源1：单个环境变量 DEEPSEEK_AUTH（★推荐方式）===
+        deepseek_auth_env = os.getenv("DEEPSEEK_AUTH", "").strip()
+        if deepseek_auth_env:
+            print("  📋 认证来源: 环境变量 DEEPSEEK_AUTH（单变量模式）")
+            try:
+                parsed = json.loads(deepseek_auth_env)
+                auth_data["cookies"] = parsed.get("cookies", [])
+                auth_data["local_storage"] = parsed.get("local_storage", {})
+                auth_data["session_storage"] = parsed.get("session_storage", {})
+                # 如果里面还有 token 字段也取出来
+                if parsed.get("token"):
+                    auth_data["token"] = parsed["token"]
+                print(f"  ✅ 解析成功: {len(auth_data['cookies'])} 个 Cookie, "
+                      f"{len(auth_data['local_storage'])} 项 localStorage, "
+                      f"{len(auth_data['session_storage'])} 项 sessionStorage")
+                return auth_data
+            except json.JSONDecodeError as e:
+                print(f"  ⚠️ DEEPSEEK_AUTH JSON 解析失败: {e}")
+                print(f"  ⚠️ 值的前 200 字符: {deepseek_auth_env[:200]}")
+
+        # === 来源2：直接 Token ===
         token = os.getenv("DEEPSEEK_TOKEN", "").strip()
         if token:
             print("  📋 认证来源: 环境变量 DEEPSEEK_TOKEN")
             auth_data["token"] = token
             return auth_data
 
-        # === 来源2：环境变量 Cookie JSON ===
+        # === 来源3：环境变量 Cookie JSON ===
         cookies_env = os.getenv("DEEPSEEK_COOKIES", "").strip()
         if cookies_env:
             print("  📋 认证来源: 环境变量 DEEPSEEK_COOKIES")
@@ -75,23 +97,24 @@ class AuthHandler:
                     print(f"  ⚠️ DEEPSEEK_LOCAL_STORAGE JSON 解析失败: {e}")
             return auth_data
 
-        # === 来源3：本地文件 ===
-        cookie_file = Path("deepseek_cookies.json")
-        if cookie_file.exists():
-            print(f"  📋 认证来源: 本地文件 {cookie_file}")
-            try:
-                with open(cookie_file, "r", encoding="utf-8") as f:
-                    file_data = json.load(f)
-                auth_data["cookies"] = file_data.get("cookies", [])
-                auth_data["local_storage"] = file_data.get("local_storage", {})
-                auth_data["session_storage"] = file_data.get("session_storage", {})
-                return auth_data
-            except Exception as e:
-                print(f"  ⚠️ 读取 Cookie 文件失败: {e}")
+        # === 来源4：本地文件 ===
+        for filename in ["deepseek_auth.json", "deepseek_cookies.json"]:
+            cookie_file = Path(filename)
+            if cookie_file.exists():
+                print(f"  📋 认证来源: 本地文件 {cookie_file}")
+                try:
+                    with open(cookie_file, "r", encoding="utf-8") as f:
+                        file_data = json.load(f)
+                    auth_data["cookies"] = file_data.get("cookies", [])
+                    auth_data["local_storage"] = file_data.get("local_storage", {})
+                    auth_data["session_storage"] = file_data.get("session_storage", {})
+                    return auth_data
+                except Exception as e:
+                    print(f"  ⚠️ 读取 {filename} 文件失败: {e}")
 
         print("  ❌ 未找到任何认证数据！")
         print("     请先运行 export_cookies.py 导出 Cookie，")
-        print("     或设置环境变量 DEEPSEEK_TOKEN / DEEPSEEK_COOKIES")
+        print("     或设置环境变量 DEEPSEEK_AUTH（推荐）/ DEEPSEEK_TOKEN / DEEPSEEK_COOKIES")
         return auth_data
 
     async def login(self, email: str = "", password: str = "") -> bool:
@@ -112,7 +135,7 @@ class AuthHandler:
             return False
 
         try:
-            # ==== 步骤 1：先导航到 DeepSeek 域名下（Cookie 必须在对应域名下才能注入）====
+            # ==== 步骤 1：先导航到 DeepSeek 域名下 ====
             print("\n  [1/4] 导航到 DeepSeek 域名...")
             await self.page.goto(
                 "https://chat.deepseek.com/",
@@ -138,7 +161,6 @@ class AuthHandler:
             elif has_storage:
                 print(f"\n  [3/4] 注入 {len(auth_data['local_storage'])} 项 localStorage...")
                 await self._inject_local_storage(auth_data["local_storage"])
-                # 注入 sessionStorage
                 if auth_data.get("session_storage"):
                     await self._inject_session_storage(auth_data["session_storage"])
                 print("  ✅ localStorage 注入完成。")
@@ -150,7 +172,6 @@ class AuthHandler:
             await self.page.reload(wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
 
-            # 检查是否成功进入聊天页面
             success = await self._verify_login(max_wait=30)
 
             if success:
@@ -174,7 +195,6 @@ class AuthHandler:
             print("  ⚠️ 无法注入 Cookie：context 未提供")
             return
 
-        # Playwright 的 add_cookies 需要特定格式
         formatted_cookies = []
         for cookie in cookies:
             c = {
@@ -183,7 +203,6 @@ class AuthHandler:
                 "domain": cookie.get("domain", ".deepseek.com"),
                 "path": cookie.get("path", "/"),
             }
-            # 可选字段
             if cookie.get("expires") and cookie["expires"] > 0:
                 c["expires"] = cookie["expires"]
             if cookie.get("httpOnly") is not None:
@@ -191,7 +210,6 @@ class AuthHandler:
             if cookie.get("secure") is not None:
                 c["secure"] = cookie["secure"]
             if cookie.get("sameSite"):
-                # Playwright 要求 sameSite 首字母大写
                 ss = cookie["sameSite"]
                 if ss.lower() in ("strict", "lax", "none"):
                     c["sameSite"] = ss.capitalize()
@@ -204,13 +222,11 @@ class AuthHandler:
             await self.context.add_cookies(formatted_cookies)
             print(f"  ✅ 成功注入 {len(formatted_cookies)} 个 Cookie")
 
-            # 打印关键 Cookie 用于调试
             for c in formatted_cookies:
                 if any(kw in c["name"].lower() for kw in ["token", "session", "auth", "user"]):
                     print(f"     🔑 {c['name']}: {c['value'][:30]}...")
         except Exception as e:
-            print(f"  ⚠️ Cookie 注入出错: {e}")
-            # 尝试逐个注入，跳过有问题的
+            print(f"  ⚠️ Cookie 批量注入出错: {e}，尝试逐个注入...")
             success_count = 0
             for c in formatted_cookies:
                 try:
@@ -221,33 +237,22 @@ class AuthHandler:
             print(f"  ✅ 成功注入 {success_count}/{len(formatted_cookies)} 个 Cookie")
 
     async def _inject_token(self, token: str):
-        """将 Token 直接注入到 localStorage（DeepSeek 常用的存储方式）。"""
+        """将 Token 直接注入到 localStorage。"""
         await self.page.evaluate(f"""
             () => {{
-                // DeepSeek 常见的 token 存储 key
                 const token = {json.dumps(token)};
-                
-                // 尝试多种常见的 key 名
                 localStorage.setItem('token', token);
                 localStorage.setItem('ds_token', token);
                 localStorage.setItem('userToken', token);
-                
-                // DeepSeek 可能使用的用户信息格式
                 try {{
                     const userInfo = JSON.parse(localStorage.getItem('ds_chat_user_info') || '{{}}');
                     userInfo.token = token;
                     localStorage.setItem('ds_chat_user_info', JSON.stringify(userInfo));
                 }} catch(e) {{}}
-                
-                // 有些版本会把整个 auth 状态存在一个 key 里
                 try {{
-                    const authState = {{
-                        token: token,
-                        isLoggedIn: true
-                    }};
+                    const authState = {{ token: token, isLoggedIn: true }};
                     localStorage.setItem('auth', JSON.stringify(authState));
                 }} catch(e) {{}}
-                
                 console.log('Token injected successfully');
             }}
         """)
@@ -257,17 +262,12 @@ class AuthHandler:
         for key, value in storage_data.items():
             try:
                 await self.page.evaluate(
-                    """
-                    ([key, value]) => {
-                        localStorage.setItem(key, value);
-                    }
-                    """,
+                    "([key, value]) => { localStorage.setItem(key, value); }",
                     [key, value],
                 )
             except Exception as e:
                 print(f"  ⚠️ 注入 localStorage[{key}] 失败: {e}")
 
-        # 打印关键项
         for key, value in storage_data.items():
             if any(kw in key.lower() for kw in ["token", "auth", "user", "session"]):
                 preview = str(value)[:50]
@@ -278,11 +278,7 @@ class AuthHandler:
         for key, value in storage_data.items():
             try:
                 await self.page.evaluate(
-                    """
-                    ([key, value]) => {
-                        sessionStorage.setItem(key, value);
-                    }
-                    """,
+                    "([key, value]) => { sessionStorage.setItem(key, value); }",
                     [key, value],
                 )
             except Exception as e:
@@ -294,25 +290,21 @@ class AuthHandler:
             await asyncio.sleep(1)
             current_url = self.page.url
 
-            # 如果还在登录页，说明还没成功
             if "sign_in" in current_url or "login" in current_url:
                 if i % 10 == 0 and i > 0:
                     print(f"  ⏳ 验证登录状态中... ({i}s) URL: {current_url}")
                 continue
 
-            # 检查页面上是否有聊天界面的特征元素
             is_chat_page = await self.page.evaluate("""
                 () => {
-                    // 检查多种聊天页面的特征
                     const indicators = [
-                        'textarea',                          // 输入框
-                        '[contenteditable="true"]',          // 可编辑区域
-                        '[class*="chat"]',                   // 聊天相关类
-                        '[class*="sidebar"]',                // 侧边栏
-                        '[class*="conversation"]',           // 对话列表
-                        '#chat-input',                       // 聊天输入
+                        'textarea',
+                        '[contenteditable="true"]',
+                        '[class*="chat"]',
+                        '[class*="sidebar"]',
+                        '[class*="conversation"]',
+                        '#chat-input',
                     ];
-                    
                     for (const sel of indicators) {
                         const el = document.querySelector(sel);
                         if (el) return true;
@@ -325,13 +317,11 @@ class AuthHandler:
                 print(f"  ✅ 已进入聊天页面（等待了 {i + 1} 秒）")
                 return True
 
-            # URL 已离开登录页，但还在加载
             if "chat.deepseek.com" in current_url:
                 if i > 10:
                     print(f"  ✅ URL 已是 DeepSeek 主域名: {current_url}")
                     return True
 
-        # 最后检查一次 URL
         final_url = self.page.url
         if "sign_in" not in final_url and "login" not in final_url:
             return True
