@@ -1,22 +1,20 @@
 # app.py
 """
 主服务器：FastAPI + WebSocket 代理
-外部请求通过 HTTP/WebSocket 进入，由内部浏览器在已认证的上下文中执行。
-支持通过环境变量 API_SECRET_KEY 设置 API 密钥鉴权。
+外部请求通过 HTTP/WebSocket 进入，由内部浏览器通过 DOM 交互执行。
 """
 
 import os
 import sys
 import json
 import asyncio
-import signal
 import time
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer
 import uvicorn
 
 from browser_manager import BrowserManager
@@ -28,18 +26,11 @@ from keepalive import KeepaliveService
 browser_mgr: BrowserManager = None
 keepalive_svc: KeepaliveService = None
 
-# API 密钥鉴权：从环境变量读取，默认值 zxcvbnm
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "zxcvbnm")
 security = HTTPBearer(auto_error=False)
 
 
 def verify_api_key(request: Request):
-    """
-    验证 API 密钥。支持三种传递方式：
-    1. Authorization: Bearer <key>
-    2. X-API-Key: <key>
-    3. 查询参数 ?api_key=<key>
-    """
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:].strip()
@@ -58,9 +49,7 @@ def verify_api_key(request: Request):
         status_code=401,
         detail={
             "error": {
-                "message": "Invalid API key. Please provide a valid key via "
-                           "'Authorization: Bearer <key>' header, "
-                           "'X-API-Key: <key>' header, or '?api_key=<key>' query param.",
+                "message": "Invalid API key.",
                 "type": "invalid_request_error",
                 "code": "invalid_api_key",
             }
@@ -68,11 +57,7 @@ def verify_api_key(request: Request):
     )
 
 
-# ============================================================
-# 等待浏览器就绪的辅助函数
-# ============================================================
 async def ensure_browser_ready():
-    """确保浏览器已初始化完成。初始化期间阻塞等待，超时返回503。"""
     if browser_mgr is None:
         raise HTTPException(status_code=503, detail="服务正在启动中，请稍后重试")
 
@@ -86,16 +71,13 @@ async def ensure_browser_ready():
         raise HTTPException(status_code=503, detail="浏览器会话已断开")
 
 
-# ============================================================
-# FastAPI 生命周期管理
-# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用启动时先让服务器就绪，再在后台初始化浏览器。"""
     global browser_mgr, keepalive_svc
 
     print(f"\n{'='*60}")
     print(f"  应用启动 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  模式: DOM 交互（无需手动 PoW）")
     print(f"  API_SECRET_KEY: {API_SECRET_KEY[:3]}{'*' * (len(API_SECRET_KEY) - 3)}")
     print(f"{'='*60}\n")
 
@@ -116,7 +98,6 @@ async def lifespan(app: FastAPI):
 
 
 async def initialize_background():
-    """后台初始化浏览器，完成后启动心跳服务。"""
     global browser_mgr, keepalive_svc
     print("⏳ 后台任务：开始初始化浏览器...")
     try:
@@ -127,17 +108,18 @@ async def initialize_background():
             await keepalive_svc.start()
     except Exception as e:
         print(f"❌ 后台任务：浏览器初始化失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 app = FastAPI(title="DeepSeek Proxy", lifespan=lifespan)
 
 
 # ============================================================
-# 健康检查 & 状态页（不需要鉴权）
+# 健康检查 & 状态页
 # ============================================================
 @app.get("/")
 async def index():
-    """状态仪表盘页面。"""
     status = await browser_mgr.get_status() if browser_mgr else {"status": "initializing"}
     uptime = status.get("uptime_seconds", 0)
     hours, remainder = divmod(int(uptime), 3600)
@@ -163,14 +145,14 @@ async def index():
         <title>DeepSeek Proxy</title>
         <meta http-equiv="refresh" content="10">
         <style>
-            body {{ font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; 
+            body {{ font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9;
                    display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
-            .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; 
+            .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px;
                      padding: 40px; max-width: 500px; width: 90%; }}
             h1 {{ color: #58a6ff; margin-top: 0; }}
             .status {{ display: flex; align-items: center; gap: 10px; margin: 20px 0; }}
             .dot {{ width: 12px; height: 12px; border-radius: 50%; background: {dot_color}; }}
-            .info {{ background: #21262d; padding: 15px; border-radius: 8px; margin: 10px 0; 
+            .info {{ background: #21262d; padding: 15px; border-radius: 8px; margin: 10px 0;
                      font-family: monospace; font-size: 14px; }}
             .label {{ color: #8b949e; }}
         </style>
@@ -187,15 +169,12 @@ async def index():
                 <div><span class="label">就绪状态：</span>{"✅ 就绪" if ready else "⏳ 初始化中"}</div>
                 <div><span class="label">登录状态：</span>{"✅ 已登录" if status.get("logged_in") else "❌ 未登录"}</div>
                 <div><span class="label">引擎：</span>{status.get("engine", "N/A")}</div>
-                <div><span class="label">Token：</span>{"✅ 有" if status.get("has_token") else "❌ 无"}</div>
+                <div><span class="label">模式：</span>{status.get("mode", "N/A")}</div>
                 <div><span class="label">心跳次数：</span>{status.get("heartbeat_count", 0)}</div>
                 <div><span class="label">处理请求：</span>{status.get("requests_handled", 0)}</div>
-                <div><span class="label">API鉴权：</span>✅ 已启用</div>
             </div>
             <p style="color: #8b949e; font-size: 12px;">
                 POST /v1/chat/completions 发送聊天请求（需要 API Key）<br>
-                WS /ws 建立 WebSocket 连接（需要 API Key）<br>
-                <br>
                 鉴权方式：Authorization: Bearer &lt;your-api-key&gt;
             </p>
         </div>
@@ -207,7 +186,6 @@ async def index():
 
 @app.get("/health")
 async def health():
-    """健康检查端点。"""
     if browser_mgr and browser_mgr.is_ready:
         return {"status": "ok", "ready": True}
     return {"status": "initializing", "ready": False}
@@ -215,7 +193,6 @@ async def health():
 
 @app.get("/status")
 async def status():
-    """详细状态端点。"""
     if browser_mgr:
         return await browser_mgr.get_status()
     return {"status": "initializing"}
@@ -223,7 +200,6 @@ async def status():
 
 @app.get("/screenshot")
 async def screenshot():
-    """获取当前浏览器截图（Base64），用于调试。"""
     if not browser_mgr:
         raise HTTPException(status_code=503, detail="浏览器未就绪")
     img_base64 = await browser_mgr.take_screenshot_base64()
@@ -237,12 +213,8 @@ async def screenshot():
     raise HTTPException(status_code=500, detail="截图失败")
 
 
-# ============================================================
-# OpenAI 兼容端点：列出模型（需要鉴权）
-# ============================================================
 @app.get("/v1/models")
 async def list_models(request: Request):
-    """列出可用模型，兼容 OpenAI API 格式。"""
     verify_api_key(request)
     return {
         "object": "list",
@@ -257,42 +229,46 @@ async def list_models(request: Request):
     }
 
 
-# ============================================================
-# 辅助函数：将 messages 数组拼接为完整的上下文字符串
-# ============================================================
 def build_prompt_from_messages(messages: list) -> str:
     """将 OpenAI 格式的 messages 数组拼接为单个 prompt 字符串。"""
-    prompt_parts = []
-    prompt_parts.append("请根据以下对话历史和最后一个用户对话，生成对应的回复。")
+    # 如果只有一条用户消息，直接返回内容
+    user_messages = [m for m in messages if m.get("role") == "user"]
+    if len(messages) == 1 and messages[0].get("role") == "user":
+        content = messages[0].get("content", "")
+        if isinstance(content, str):
+            return content
+        elif isinstance(content, list):
+            return "".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
 
+    # 多轮对话，拼接上下文
+    prompt_parts = []
     for message in messages:
         role = message.get("role", "")
         content = message.get("content", "")
 
-        processed_content = ""
-        if isinstance(content, str):
-            processed_content = content
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    processed_content += part.get("text", "")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
 
-        if role and processed_content:
-            prompt_parts.append(f"角色: {role}\n内容: {processed_content}")
+        if role == "system":
+            prompt_parts.append(f"[系统指令] {content}")
+        elif role == "user":
+            prompt_parts.append(f"[用户] {content}")
+        elif role == "assistant":
+            prompt_parts.append(f"[助手] {content}")
 
-    return "\n\n---\n\n".join(prompt_parts)
+    prompt_parts.append("\n请基于以上对话历史，回复最后一条用户消息。")
+    return "\n\n".join(prompt_parts)
 
 
-# ============================================================
-# 核心 API：兼容 OpenAI 格式的聊天接口（需要鉴权）
-# ============================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """兼容 OpenAI API 格式的聊天端点。需要 API Key 鉴权。"""
-    # 鉴权
     verify_api_key(request)
-
-    # ★ 关键改动：等待浏览器就绪，不再直接 503
     await ensure_browser_ready()
 
     try:
@@ -305,7 +281,6 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="messages 不能为空")
 
     stream = body.get("stream", False)
-
     user_prompt = build_prompt_from_messages(messages)
 
     if not user_prompt:
@@ -320,7 +295,7 @@ async def chat_completions(request: Request):
                     "id": f"chatcmpl-{int(time.time()*1000)}",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
-                    "model": "deepseek-chat",
+                    "model": body.get("model", "deepseek-chat"),
                     "choices": [{
                         "index": 0,
                         "delta": {"content": chunk},
@@ -333,7 +308,7 @@ async def chat_completions(request: Request):
                 "id": f"chatcmpl-{int(time.time()*1000)}",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": "deepseek-chat",
+                "model": body.get("model", "deepseek-chat"),
                 "choices": [{
                     "index": 0,
                     "delta": {},
@@ -350,7 +325,7 @@ async def chat_completions(request: Request):
             "id": f"chatcmpl-{int(time.time()*1000)}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": "deepseek-chat",
+            "model": body.get("model", "deepseek-chat"),
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": response_text},
@@ -364,12 +339,8 @@ async def chat_completions(request: Request):
         }
 
 
-# ============================================================
-# WebSocket 端点（需要鉴权）
-# ============================================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket 连接。"""
     await websocket.accept()
     print(f"📡 WebSocket 客户端已连接: {websocket.client}")
 
@@ -381,10 +352,7 @@ async def websocket_endpoint(websocket: WebSocket):
             first_msg = await asyncio.wait_for(websocket.receive_text(), timeout=10)
             try:
                 payload = json.loads(first_msg)
-                if payload.get("type") == "auth" and payload.get("api_key") == API_SECRET_KEY:
-                    authenticated = True
-                    await websocket.send_json({"type": "auth", "status": "ok"})
-                elif payload.get("api_key") == API_SECRET_KEY:
+                if payload.get("api_key") == API_SECRET_KEY:
                     authenticated = True
                     await websocket.send_json({"type": "auth", "status": "ok"})
             except json.JSONDecodeError:
@@ -395,8 +363,7 @@ async def websocket_endpoint(websocket: WebSocket):
     if not authenticated:
         await websocket.send_json({
             "type": "error",
-            "error": "Authentication required. Send {\"type\":\"auth\",\"api_key\":\"<key>\"} "
-                     "or connect with ?api_key=<key>"
+            "error": "Authentication required."
         })
         await websocket.close(code=4001, reason="Unauthorized")
         return
@@ -414,7 +381,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"error": "消息不能为空"})
                 continue
 
-            # WebSocket 也等待就绪
             if not browser_mgr or not browser_mgr.is_ready:
                 await websocket.send_json({"type": "info", "message": "浏览器初始化中，请稍候..."})
                 ok = await browser_mgr.wait_until_ready(timeout=180) if browser_mgr else False
@@ -443,9 +409,6 @@ async def websocket_endpoint(websocket: WebSocket):
             pass
 
 
-# ============================================================
-# 入口
-# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
