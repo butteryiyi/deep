@@ -1,5 +1,6 @@
 # browser_manager.py
-# 根据探针数据精确重写，针对 DeepSeek 真实 DOM 结构优化
+# 基于探针 probe_20260316_111934.json 精确数据编写
+# 核心策略：DOM 轮询 + 复制按钮(剪贴板拦截) + 审查快照
 
 import os
 import sys
@@ -37,201 +38,195 @@ def _is_censored(text: str) -> bool:
     return False
 
 
-# ═══════════════════════════════════════════════════
-# 注入到页面的 JS：精确匹配探针发现的 DOM 结构
-# ═══════════════════════════════════════════════════
-
-# 基于探针发现：
-# 1. fetch 拦截拿不到 SSE（DeepSeek 可能用 WebSocket 或内部拦截）
-# 2. 复制按钮（第一个 ds-icon-button）点击后 clipboard 有完整内容
-# 3. DOM 中 div.ds-message > div.ds-markdown（非 ds-think-content 子代）= 正式回复
-# 4. 思考区域 = div.ds-think-content > div.ds-markdown
-
-COLLECTOR_JS = """
+# ═══════════════════════════════════════════════════════════════
+# 注入脚本：只做剪贴板拦截（探针证实 SSE 拦截无效）
+# ═══════════════════════════════════════════════════════════════
+INSTALL_CLIPBOARD_HOOK_JS = """
 () => {
-    window.__col = {
-        clipText: '',
-        clipTime: 0,
-        bestSnapshot: '',
-        installed: true,
-    };
-
-    // 拦截剪贴板 - 这是最可靠的完整内容源
+    if (window.__clipHooked) return 'already';
+    window.__clipData = { text: '', time: 0 };
     try {
         const orig = navigator.clipboard.writeText.bind(navigator.clipboard);
         navigator.clipboard.writeText = async function(text) {
             if (text && text.length > 5) {
-                window.__col.clipText = text;
-                window.__col.clipTime = Date.now();
+                window.__clipData = { text: text, time: Date.now() };
             }
             return orig(text);
         };
-    } catch(e) {}
-
-    console.log('[Col] installed');
-    return true;
+        window.__clipHooked = true;
+        return 'ok';
+    } catch(e) {
+        return 'fail:' + e.message;
+    }
 }
 """
 
-# 读取状态的 JS - 极其轻量，一次 evaluate 搞定
+# ═══════════════════════════════════════════════════════════════
+# 一次性读取所有状态（基于探针确认的精确结构）
+#
+# 探针确认的 DOM 结构:
+#   div[data-virtual-list-item-key]
+#     └ div.ds-message._63c77b1
+#         ├ div._74c0879 (折叠容器)
+#         │   └ div.ds-think-content._767406f
+#         │       └ div.ds-markdown  ← 思考文本(排除)
+#         └ div.ds-markdown  ← 正式回复(目标)
+#
+# 完成标志: item className 含 "_43c05b5" (生成中没有这个类)
+# 按钮位置: item 内 div.ds-flex._965abe9 > div.ds-icon-button
+# 复制按钮: 第一个 ds-icon-button, SVG 含 "M6.14923"
+# ═══════════════════════════════════════════════════════════════
 READ_STATE_JS = """
 () => {
-    const result = {
+    const R = {
         domText: '',
-        domTextLen: 0,
+        domLen: 0,
+        thinkLen: 0,
         hasButton: false,
         buttonCount: 0,
+        isComplete: false,
         isGenerating: false,
+        itemCount: 0,
         clipText: '',
         clipLen: 0,
-        itemCount: 0,
-        thinkText: '',
-        thinkLen: 0,
     };
 
-    // 找所有对话项
     const items = document.querySelectorAll('div[data-virtual-list-item-key]');
-    result.itemCount = items.length;
-    if (items.length === 0) return result;
+    R.itemCount = items.length;
+    if (items.length === 0) return R;
 
     const lastItem = items[items.length - 1];
+    const itemClass = lastItem.className || '';
 
-    // 找 ds-message 容器
+    // ══ 完成检测 ══
+    // 探针发现: 生成中 className="_4f9bf79 d7dc56a8"
+    //           完成后 className="_4f9bf79 d7dc56a8 _43c05b5"
+    R.isComplete = itemClass.includes('_43c05b5');
+
+    // ══ 消息容器 ══
     const msgDiv = lastItem.querySelector('div.ds-message');
-    if (!msgDiv) return result;
+    if (!msgDiv) return R;
 
-    // ====== 正式回复：ds-message 的直接子代 ds-markdown ======
-    // 排除 ds-think-content 内的 ds-markdown
-    const allMd = msgDiv.querySelectorAll(':scope > div.ds-markdown');
-    if (allMd.length > 0) {
-        // 直接子代中的 ds-markdown 就是正式回复
-        const replyMd = allMd[allMd.length - 1];
-        result.domText = replyMd.innerText || '';
-        result.domTextLen = result.domText.length;
-    } else {
-        // 备选：找所有 ds-markdown，排除在 ds-think-content 内的
-        const allMdDeep = msgDiv.querySelectorAll('div.ds-markdown');
-        for (let i = allMdDeep.length - 1; i >= 0; i--) {
-            const md = allMdDeep[i];
-            // 检查是否在 ds-think-content 内
-            let inThink = false;
-            let el = md.parentElement;
-            while (el && el !== msgDiv) {
-                if (el.classList && el.classList.contains('ds-think-content')) {
-                    inThink = true;
-                    break;
-                }
-                el = el.parentElement;
-            }
-            if (!inThink) {
-                result.domText = md.innerText || '';
-                result.domTextLen = result.domText.length;
-                break;
-            }
-        }
-    }
-
-    // ====== 思考区域 ======
-    const thinkDiv = msgDiv.querySelector('div.ds-think-content');
-    if (thinkDiv) {
-        const thinkMd = thinkDiv.querySelector('div.ds-markdown');
-        if (thinkMd) {
-            result.thinkText = (thinkMd.innerText || '').substring(0, 200);
-            result.thinkLen = (thinkMd.innerText || '').length;
-        }
-    }
-
-    // ====== 按钮 ======
-    const buttons = lastItem.querySelectorAll('div.ds-icon-button');
-    result.buttonCount = buttons.length;
-    result.hasButton = buttons.length > 0;
-
-    // ====== 生成中检测 ======
-    // 方法1: 查找停止按钮/加载动画
-    const stopBtns = document.querySelectorAll(
-        'div[class*="StopGeneration"], div[class*="stop-generation"],' +
-        'div[class*="stopGenerat"], button[class*="stop"]'
-    );
-    for (const btn of stopBtns) {
-        if (btn.offsetParent !== null) {
-            result.isGenerating = true;
+    // ══ 正式回复: ds-message 的直接子代 ds-markdown ══
+    // 探针确认: 正式回复 = div.ds-message > div.ds-markdown
+    //          思考区域 = div.ds-message > div._74c0879 > div.ds-think-content > div.ds-markdown
+    const directChildren = msgDiv.children;
+    for (let i = directChildren.length - 1; i >= 0; i--) {
+        const child = directChildren[i];
+        if (child.tagName === 'DIV' &&
+            child.classList.contains('ds-markdown') &&
+            !child.classList.contains('ds-think-content')) {
+            R.domText = child.innerText || '';
+            R.domLen = R.domText.length;
             break;
         }
     }
 
-    // 方法2: 输入框是否被禁用（生成中通常禁用输入）
-    if (!result.isGenerating) {
-        const textarea = document.querySelector('textarea');
-        if (textarea && textarea.disabled) {
-            result.isGenerating = true;
+    // ══ 思考区域 ══
+    const thinkDiv = msgDiv.querySelector('div.ds-think-content');
+    if (thinkDiv) {
+        const thinkMd = thinkDiv.querySelector('div.ds-markdown');
+        if (thinkMd) {
+            R.thinkLen = (thinkMd.innerText || '').length;
         }
     }
 
-    // 方法3: 检查是否有正在渲染的光标/动画
-    if (!result.isGenerating) {
-        const cursors = document.querySelectorAll(
-            'span[class*="cursor"], span[class*="blink"],' +
-            'div[class*="loading"], div[class*="typing"]'
-        );
-        for (const c of cursors) {
-            if (c.offsetParent !== null) {
-                result.isGenerating = true;
-                break;
+    // ══ 按钮 ══
+    // 探针确认: 按钮在 div.ds-flex._965abe9 > div.ds-icon-button
+    // 完成后有5个按钮（复制、重试、点赞、点踩、分享）
+    const btnContainer = lastItem.querySelector('div._965abe9');
+    if (btnContainer) {
+        const btns = btnContainer.querySelectorAll('div.ds-icon-button');
+        R.buttonCount = btns.length;
+        R.hasButton = btns.length > 0;
+    } else {
+        // 备选: 直接找
+        const btns = lastItem.querySelectorAll('div.ds-icon-button');
+        R.buttonCount = btns.length;
+        R.hasButton = btns.length >= 3;  // 至少3个才算有功能按钮（排除用户消息的2个）
+    }
+
+    // ══ 生成中检测 ══
+    // 方法1: _43c05b5 类名检测（最可靠）
+    R.isGenerating = !R.isComplete && R.itemCount >= 2;
+
+    // 方法2: 检查是否有"正在思考"动画
+    if (!R.isGenerating) {
+        const thinkAnim = lastItem.querySelector('span.e4b3a110');
+        if (thinkAnim) {
+            const style = thinkAnim.getAttribute('style') || '';
+            if (style.includes('running')) {
+                R.isGenerating = true;
             }
         }
     }
 
-    // ====== 剪贴板数据 ======
-    if (window.__col) {
-        result.clipText = window.__col.clipText || '';
-        result.clipLen = result.clipText.length;
+    // ══ 剪贴板 ══
+    if (window.__clipData) {
+        R.clipText = window.__clipData.text || '';
+        R.clipLen = R.clipText.length;
     }
 
-    // ====== 更新快照 ======
-    if (window.__col && result.domText.length > (window.__col.bestSnapshot || '').length) {
-        window.__col.bestSnapshot = result.domText;
-    }
-
-    return result;
+    return R;
 }
 """
 
-# 点击复制按钮的 JS
+# 点击复制按钮
+# 探针确认: 复制按钮 = _965abe9 容器内第一个 ds-icon-button
+# SVG path 以 "M6.14923" 开头
 CLICK_COPY_JS = """
 () => {
     const items = document.querySelectorAll('div[data-virtual-list-item-key]');
-    if (items.length === 0) return false;
+    if (items.length === 0) return 'no-items';
     const lastItem = items[items.length - 1];
 
-    // 复制按钮是第一个 ds-icon-button
-    const buttons = lastItem.querySelectorAll('div.ds-icon-button');
-    if (buttons.length === 0) return false;
-
-    // 清空之前的剪贴板记录
-    if (window.__col) {
-        window.__col.clipText = '';
-        window.__col.clipTime = 0;
+    // 清空之前的剪贴板
+    if (window.__clipData) {
+        window.__clipData = { text: '', time: 0 };
     }
 
-    buttons[0].click();
-    return true;
+    // 在 _965abe9 容器内找第一个按钮
+    const btnContainer = lastItem.querySelector('div._965abe9');
+    if (btnContainer) {
+        const firstBtn = btnContainer.querySelector('div.ds-icon-button');
+        if (firstBtn) {
+            firstBtn.click();
+            return 'clicked-965';
+        }
+    }
+
+    // 备选: 通过 SVG path 找复制按钮
+    const allBtns = lastItem.querySelectorAll('div.ds-icon-button');
+    for (const btn of allBtns) {
+        const path = btn.querySelector('svg path');
+        if (path) {
+            const d = path.getAttribute('d') || '';
+            if (d.startsWith('M6.14923')) {
+                btn.click();
+                return 'clicked-svg';
+            }
+        }
+    }
+
+    // 最后备选: 找父级是 _965abe9 或 _54866f7 的按钮
+    for (const btn of allBtns) {
+        const parentClass = btn.parentElement?.className || '';
+        if (parentClass.includes('_965abe9') || parentClass.includes('_54866f7')) {
+            btn.click();
+            return 'clicked-parent';
+        }
+    }
+
+    return 'not-found';
 }
 """
 
-# 滚动到底部的 JS（确保虚拟滚动渲染完整内容）
+# 滚动到底部
 SCROLL_BOTTOM_JS = """
 () => {
-    const scrollArea = document.querySelector('.ds-scroll-area');
-    if (scrollArea) {
-        scrollArea.scrollTop = scrollArea.scrollHeight;
-        return true;
-    }
-    // 备选
-    const vlist = document.querySelector('.ds-virtual-list');
-    if (vlist) {
-        vlist.scrollTop = vlist.scrollHeight;
-        return true;
-    }
+    // 探针确认: 滚动容器是 div._765a5cd.ds-scroll-area
+    const sa = document.querySelector('.ds-scroll-area');
+    if (sa) { sa.scrollTop = sa.scrollHeight; return true; }
     return false;
 }
 """
@@ -244,95 +239,79 @@ class ChatPage:
         self.busy = False
         self.request_count = 0
         self.last_used = 0.0
-        self._collector_ok = False
+        self._hook_installed = False
 
-    async def ensure_collector(self):
-        """确保收集器（主要是剪贴板拦截）已安装"""
+    async def ensure_clipboard_hook(self):
+        """安装/重装剪贴板拦截"""
         try:
-            ok = await self.page.evaluate("() => !!(window.__col && window.__col.installed)")
-            if ok:
+            hooked = await self.page.evaluate("() => !!window.__clipHooked")
+            if hooked:
                 return
         except Exception:
             pass
-
         try:
-            await self.page.evaluate(COLLECTOR_JS)
-            self._collector_ok = True
+            result = await self.page.evaluate(INSTALL_CLIPBOARD_HOOK_JS)
+            self._hook_installed = (result in ('ok', 'already'))
         except Exception as e:
-            print(f"  ⚠️ 页面#{self.page_id} 收集器安装失败: {e}")
+            print(f"  ⚠️ P#{self.page_id} 剪贴板 hook 失败: {e}")
 
-    async def reset_collector(self):
-        """重置收集器状态"""
+    async def reset_clip(self):
         try:
-            await self.page.evaluate("""
-                () => {
-                    if (window.__col) {
-                        window.__col.clipText = '';
-                        window.__col.clipTime = 0;
-                        window.__col.bestSnapshot = '';
-                    }
-                }
-            """)
+            await self.page.evaluate("() => { if(window.__clipData) window.__clipData = {text:'',time:0}; }")
         except Exception:
             pass
 
     async def read_state(self) -> dict:
-        """一次 evaluate 读取所有状态"""
         try:
             return await self.page.evaluate(READ_STATE_JS)
         except Exception as e:
             return {
-                "domText": "", "domTextLen": 0, "hasButton": False,
-                "buttonCount": 0, "isGenerating": False,
-                "clipText": "", "clipLen": 0, "itemCount": 0,
-                "thinkText": "", "thinkLen": 0, "error": str(e),
+                "domText": "", "domLen": 0, "thinkLen": 0,
+                "hasButton": False, "buttonCount": 0,
+                "isComplete": False, "isGenerating": False,
+                "itemCount": 0, "clipText": "", "clipLen": 0,
+                "error": str(e),
             }
 
-    async def click_copy_and_wait(self, timeout: float = 2.0) -> str:
-        """点击复制按钮并等待剪贴板拦截获取内容"""
+    async def click_copy_and_wait(self, timeout: float = 3.0) -> str:
         try:
-            clicked = await self.page.evaluate(CLICK_COPY_JS)
-            if not clicked:
+            result = await self.page.evaluate(CLICK_COPY_JS)
+            if result == 'not-found' or result == 'no-items':
                 return ""
 
-            # 等待剪贴板拦截生效
             deadline = time.time() + timeout
             while time.time() < deadline:
                 await asyncio.sleep(0.2)
                 clip = await self.page.evaluate(
-                    "() => (window.__col && window.__col.clipText) || ''"
+                    "() => (window.__clipData && window.__clipData.text) || ''"
                 )
                 if clip:
                     return clip
-
             return ""
         except Exception as e:
-            print(f"  ⚠️ 复制按钮失败: {e}")
+            print(f"  ⚠️ 复制失败: {e}")
             return ""
 
     async def scroll_to_bottom(self):
-        """滚动到底部，触发虚拟滚动渲染"""
         try:
             await self.page.evaluate(SCROLL_BOTTOM_JS)
         except Exception:
             pass
 
     async def start_new_chat(self):
-        """开启新对话"""
-        self._collector_ok = False
-        if "chat.deepseek.com" not in self.page.url:
+        self._hook_installed = False
+        if "chat.deepseek.com" not in (self.page.url or ""):
             await self.page.goto(
                 "https://chat.deepseek.com/",
-                wait_until="domcontentloaded",
-                timeout=30000,
+                wait_until="domcontentloaded", timeout=30000,
             )
             await asyncio.sleep(2)
 
+        # 探针确认: 新对话按钮
         for sel in [
             "xpath=//*[contains(text(), '开启新对话')]",
             "xpath=//*[contains(text(), '新对话')]",
             "xpath=//*[contains(text(), 'New chat')]",
-            "div.ds-icon-button",
             "[class*='new-chat']",
         ]:
             try:
@@ -346,19 +325,16 @@ class ChatPage:
 
         await self.page.goto(
             "https://chat.deepseek.com/",
-            wait_until="domcontentloaded",
-            timeout=30000,
+            wait_until="domcontentloaded", timeout=30000,
         )
         await asyncio.sleep(3)
 
     async def type_and_send(self, message: str):
-        """输入并发送消息"""
-        # 探针确认选择器: textarea[placeholder="给 DeepSeek 发送消息 "]
+        # 探针确认: textarea placeholder="给 DeepSeek 发送消息 "
         textarea = self.page.locator("textarea").first
         await textarea.wait_for(state="visible", timeout=10000)
         await textarea.click()
         await asyncio.sleep(0.3)
-
         try:
             await textarea.fill("")
             await asyncio.sleep(0.1)
@@ -375,7 +351,6 @@ class ChatPage:
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                 }
             """, message)
-
         await asyncio.sleep(0.5)
         await textarea.press("Enter")
         await asyncio.sleep(0.5)
@@ -412,6 +387,7 @@ class BrowserManager:
 
         self._ready = False
         self._ready_event = asyncio.Event()
+        self._camoufox_ctx = None
 
     async def wait_until_ready(self, timeout: float = 180.0) -> bool:
         try:
@@ -464,66 +440,64 @@ class BrowserManager:
             self._engine = "camoufox"
             self._save_camoufox_cache()
         except Exception as e:
-            print(f"⚠️ Camoufox 失败: {e}，回退 Playwright Firefox")
-            if hasattr(self, '_camoufox'):
+            print(f"⚠️ Camoufox 失败: {e}，回退 Playwright")
+            if self._camoufox_ctx:
                 try:
-                    await self._camoufox.__aexit__(None, None, None)
+                    await self._camoufox_ctx.__aexit__(None, None, None)
                 except Exception:
                     pass
+                self._camoufox_ctx = None
 
         if not camoufox_ok:
             await self._start_with_playwright()
             self._engine = "playwright-firefox"
 
-        await self._inject_stealth_scripts()
+        await self._inject_stealth()
 
+        # 登录
         first_page = await self.context.new_page()
         auth = AuthHandler(first_page, context=self.context)
         self.logged_in = await auth.login(self.email, self.password)
-
         if not self.logged_in:
             print("⚠️ 登录可能未完成")
             await first_page.close()
         else:
             print("🎉 登录成功！")
             cp = ChatPage(first_page, 0)
-            await cp.ensure_collector()
+            await cp.ensure_clipboard_hook()
             self._pages.append(cp)
-            print(f"  📄 页面 #0 就绪")
+            print(f"  📄 页面#0 就绪")
 
+        # 创建其余页面
         for i in range(1, self._page_count):
             try:
                 page = await self.context.new_page()
                 await page.goto(
                     "https://chat.deepseek.com/",
-                    wait_until="domcontentloaded",
-                    timeout=30000,
+                    wait_until="domcontentloaded", timeout=30000,
                 )
                 await asyncio.sleep(2)
                 cp = ChatPage(page, i)
-                await cp.ensure_collector()
+                await cp.ensure_clipboard_hook()
                 self._pages.append(cp)
-                print(f"  📄 页面 #{i} 就绪")
+                print(f"  📄 页面#{i} 就绪")
             except Exception as e:
-                print(f"  ⚠️ 页面 #{i} 创建失败: {e}")
+                print(f"  ⚠️ 页面#{i} 失败: {e}")
 
-        actual_count = len(self._pages)
-        self._page_semaphore = asyncio.Semaphore(actual_count)
-
+        self._page_semaphore = asyncio.Semaphore(len(self._pages))
         self._ready = True
         self._ready_event.set()
-        print(f"✅ 就绪（引擎: {self._engine}，{actual_count} 个并发页面）")
+        print(f"✅ 就绪（{self._engine}，{len(self._pages)} 并发页面）")
 
     async def _start_with_camoufox(self):
         from camoufox.async_api import AsyncCamoufox
-        self._camoufox = AsyncCamoufox(headless=self.headless, geoip=False)
-        self.browser = await self._camoufox.__aenter__()
+        self._camoufox_ctx = AsyncCamoufox(headless=self.headless, geoip=False)
+        self.browser = await self._camoufox_ctx.__aenter__()
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
+            locale="zh-CN", timezone_id="Asia/Shanghai",
         )
-        print("  ✅ Camoufox 已启动")
+        print("  ✅ Camoufox 启动")
 
     async def _start_with_playwright(self):
         from playwright.async_api import async_playwright
@@ -543,16 +517,15 @@ class BrowserManager:
             )
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
+            locale="zh-CN", timezone_id="Asia/Shanghai",
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
                 "Gecko/20100101 Firefox/126.0"
             ),
         )
-        print("  ✅ Playwright Firefox 已启动")
+        print("  ✅ Playwright Firefox 启动")
 
-    async def _inject_stealth_scripts(self):
+    async def _inject_stealth(self):
         if self._engine == "camoufox":
             await self.context.add_init_script(
                 "if(navigator.webdriver!==undefined)"
@@ -602,81 +575,66 @@ class BrowserManager:
         self.total_requests += 1
         self.requests_handled += 1
         req_id = self.total_requests
-        print(f"📨 请求 #{req_id} (长度: {len(message)} 字符)")
+        print(f"📨 #{req_id} ({len(message)} 字符)")
 
         cp = None
         try:
             cp = await asyncio.wait_for(self._acquire_page(), timeout=300)
-        except asyncio.TimeoutError:
-            yield "[错误] 所有页面忙碌，请稍后重试"
-            return
-        except Exception as e:
+        except (asyncio.TimeoutError, RuntimeError) as e:
             yield f"[错误] {e}"
             return
 
-        print(f"  [{req_id}] 分配到页面 #{cp.page_id}")
+        print(f"  [#{req_id}] → 页面#{cp.page_id}")
 
         try:
             cp.request_count += 1
 
-            # 检查页面存活
+            # 检查存活
             if not await cp.is_alive():
-                print(f"  [{req_id}] 页面 #{cp.page_id} 已死，恢复中...")
+                print(f"  [#{req_id}] 页面死亡，恢复中...")
                 try:
                     new_page = await self.context.new_page()
                     await new_page.goto(
                         "https://chat.deepseek.com/",
-                        wait_until="domcontentloaded",
-                        timeout=30000,
+                        wait_until="domcontentloaded", timeout=30000,
                     )
                     await asyncio.sleep(2)
                     cp.page = new_page
-                    cp._collector_ok = False
+                    cp._hook_installed = False
                 except Exception as e:
                     yield f"[错误] 页面恢复失败: {e}"
                     return
 
-            # 开新对话
+            # 新对话
             await cp.start_new_chat()
             await asyncio.sleep(0.5)
 
-            # 安装/重新安装收集器（start_new_chat 可能导致页面变化）
-            await cp.ensure_collector()
-            await cp.reset_collector()
+            # 安装 hook + 重置
+            await cp.ensure_clipboard_hook()
+            await cp.reset_clip()
 
-            # 发送消息
+            # 发送
             await cp.type_and_send(message)
-            print(f"  [{req_id}] 消息已发送")
+            print(f"  [#{req_id}] 已发送")
 
             # ═══════════════════════════════════════════
-            # 流式读取策略（基于探针结论）：
-            #
-            # 主数据源: DOM (div.ds-message > div.ds-markdown)
-            #   - 轮询 innerText，增量输出
-            #   - 排除 ds-think-content 内的内容
-            #
-            # 兜底数据源: 复制按钮 → 剪贴板拦截
-            #   - 完成后点复制按钮获取完整内容
-            #   - 如果 DOM 读的少于复制的，补齐差异
-            #
-            # 抗审查: 持续维护快照(bestSnapshot)
+            # 流式读取主循环
             # ═══════════════════════════════════════════
-
             max_wait = 600
-            poll_interval = 0.3  # 300ms 够了，DOM 读取很轻量
-
+            poll_interval = 0.4
             yielded_len = 0
-            best_text = ""
-            generation_started = False
+            best_text = ""        # 抗审查快照
+            gen_started = False
             no_change_count = 0
-            prev_dom_len = 0
+            prev_len = 0
             start_ts = time.time()
+            scroll_counter = 0
 
-            # 等待对话项出现（AI 开始回复）
-            for _ in range(int(30 / 0.5)):
+            # 等 AI 开始生成（第二个 item 出现）
+            for _ in range(60):
                 await asyncio.sleep(0.5)
-                state = await cp.read_state()
-                if state.get("itemCount", 0) >= 2:
+                st = await cp.read_state()
+                if st.get("itemCount", 0) >= 2:
                     break
                 if time.time() - start_ts > 30:
                     break
@@ -684,197 +642,154 @@ class BrowserManager:
             while True:
                 elapsed = time.time() - start_ts
                 if elapsed > max_wait:
-                    print(f"  [{req_id}] ⏰ 总超时 {max_wait}s")
+                    print(f"  [#{req_id}] ⏰ 超时 {max_wait}s")
                     break
 
                 await asyncio.sleep(poll_interval)
+                scroll_counter += 1
 
+                # 每 12 次（~5秒）滚动一下
+                if scroll_counter % 12 == 0:
+                    await cp.scroll_to_bottom()
+
+                # 读状态
                 state = await cp.read_state()
                 dom_text = state.get("domText", "")
-                dom_len = state.get("domTextLen", 0)
+                dom_len = state.get("domLen", 0)
+                think_len = state.get("thinkLen", 0)
+                is_complete = state.get("isComplete", False)
                 has_button = state.get("hasButton", False)
                 is_gen = state.get("isGenerating", False)
-                item_count = state.get("itemCount", 0)
-                think_len = state.get("thinkLen", 0)
+                btn_count = state.get("buttonCount", 0)
 
                 # 检测生成开始
-                if (dom_len > 0 or think_len > 0 or is_gen) and not generation_started:
-                    generation_started = True
+                if not gen_started and (dom_len > 0 or think_len > 0 or is_gen):
+                    gen_started = True
                     no_change_count = 0
-                    gen_type = []
-                    if think_len > 0:
-                        gen_type.append(f"思考{think_len}字")
-                    if dom_len > 0:
-                        gen_type.append(f"回复{dom_len}字")
-                    if is_gen:
-                        gen_type.append("生成中")
-                    print(f"  [{req_id}] 🚀 生成开始 ({', '.join(gen_type)})")
+                    print(f"  [#{req_id}] 🚀 开始 (think={think_len} reply={dom_len} gen={is_gen})")
 
-                # 更新最佳文本
+                # 更新快照
                 if dom_len > len(best_text):
                     best_text = dom_text
 
-                # ---- 审查检测 ----
-                if (generation_started and len(best_text) > 80 and
-                    dom_text and dom_len < len(best_text) * 0.4 and
-                    _is_censored(dom_text)):
-                    print(f"  [{req_id}] 🛡️ 审查替换！当前={dom_len} 快照={len(best_text)}")
+                # ── 审查检测 ──
+                if (gen_started and len(best_text) > 80
+                    and dom_text and dom_len < len(best_text) * 0.4
+                    and _is_censored(dom_text)):
+                    print(f"  [#{req_id}] 🛡️ 审查! dom={dom_len} snap={len(best_text)}")
                     remaining = best_text[yielded_len:]
                     if remaining:
                         yield remaining
                     break
 
-                # ---- 流式增量输出 ----
+                # ── 流式增量输出 ──
                 if dom_text and dom_len > yielded_len:
                     new_part = dom_text[yielded_len:]
-                    # 生成中时直接输出
-                    if is_gen or not has_button:
+                    if not is_complete:
+                        # 生成中: 直接输出
                         yield new_part
                         yielded_len = dom_len
                         no_change_count = 0
-                    elif has_button and not _is_censored(dom_text):
+                    elif not _is_censored(dom_text):
                         # 已完成且非审查
                         yield new_part
                         yielded_len = dom_len
 
-                # ---- 定期滚动到底部（对抗虚拟滚动截断）----
-                if generation_started and int(elapsed) % 5 == 0 and int(elapsed * 10) % 50 < 4:
-                    await cp.scroll_to_bottom()
-
-                # ---- 完成检测 ----
-                if generation_started and has_button and not is_gen:
-                    # 等待一下确认真的完成了
+                # ── 完成检测 ──
+                # 探针发现: is_complete = className 含 _43c05b5
+                # 同时 has_button = 有5个功能按钮
+                if gen_started and is_complete and has_button and btn_count >= 3:
+                    # 再等一下确认
                     await asyncio.sleep(0.5)
-                    confirm_state = await cp.read_state()
-                    if (confirm_state.get("hasButton", False) and
-                        not confirm_state.get("isGenerating", False)):
-
-                        confirm_text = confirm_state.get("domText", "")
-                        confirm_len = confirm_state.get("domTextLen", 0)
-
-                        # 滚到底部再读一次，确保虚拟滚动没截断
+                    confirm = await cp.read_state()
+                    if confirm.get("isComplete", False) and confirm.get("hasButton", False):
+                        # 滚到底再读一次
                         await cp.scroll_to_bottom()
                         await asyncio.sleep(0.3)
-                        final_state = await cp.read_state()
-                        final_text = final_state.get("domText", "")
-                        final_len = final_state.get("domTextLen", 0)
+                        final = await cp.read_state()
+                        final_text = final.get("domText", "")
+                        final_len = final.get("domLen", 0)
 
-                        # 取最长的
-                        if final_len > confirm_len:
-                            confirm_text = final_text
-                            confirm_len = final_len
+                        if final_len > len(best_text):
+                            best_text = final_text
 
-                        # 更新 best_text
-                        if confirm_len > len(best_text):
-                            best_text = confirm_text
-
-                        # 输出剩余部分
-                        if confirm_len > yielded_len:
-                            if not _is_censored(confirm_text):
-                                yield confirm_text[yielded_len:]
-                                yielded_len = confirm_len
+                        # 输出剩余
+                        use_text = best_text if final_len < len(best_text) else final_text
+                        if len(use_text) > yielded_len:
+                            if not _is_censored(use_text):
+                                yield use_text[yielded_len:]
+                                yielded_len = len(use_text)
                             else:
                                 remaining = best_text[yielded_len:]
                                 if remaining:
                                     yield remaining
                                     yielded_len = len(best_text)
-                                print(f"  [{req_id}] 🛡️ 完成时审查替换")
+                                print(f"  [#{req_id}] 🛡️ 完成时审查")
 
-                        # === 核心：点复制按钮获取完整内容 ===
+                        # ══ 点复制按钮获取完整 markdown ══
                         clip_text = await cp.click_copy_and_wait(timeout=3.0)
                         if clip_text:
-                            clip_len = len(clip_text)
-                            print(f"  [{req_id}] 📋 复制按钮: {clip_len} 字符 "
-                                  f"(DOM: {yielded_len} 字符)")
+                            print(f"  [#{req_id}] 📋 clip={len(clip_text)} dom={yielded_len}")
 
-                            # 如果剪贴板内容比已输出的更多
-                            # 注意：剪贴板是 markdown 格式，DOM 是纯文本
-                            # 剪贴板通常更长因为包含 ## ** 等格式符号
-                            if clip_len > yielded_len and not _is_censored(clip_text):
-                                # 剪贴板内容可能和 DOM 内容格式不同
-                                # 如果差距很大（>30%），说明 DOM 可能被虚拟滚动截断
-                                if clip_len > yielded_len * 1.3:
-                                    # DOM 严重截断，用剪贴板内容替代
-                                    print(f"  [{req_id}] ⚠️ DOM 可能被截断，"
-                                          f"补充剪贴板差异")
-                                    # 不能简单拼接（格式不同），但可以发送差异提示
-                                    # 或者直接用剪贴板全文替代
-                                    # 这里我们检查是否 DOM 文本是剪贴板的子集
-                                    dom_clean = best_text.replace('\n', '').replace(' ', '')
-                                    clip_clean = clip_text.replace('\n', '').replace(' ', '')
-                                    clip_clean = clip_clean.replace('#', '').replace('*', '')
-
-                                    if len(dom_clean) < len(clip_clean) * 0.7:
-                                        # DOM 确实被截断了，重新用剪贴板全文
-                                        # 但要注意已经 yield 了一部分
-                                        # 最安全的做法：记录下来，让调用者知道
-                                        print(f"  [{req_id}] 📋 DOM截断严重，"
-                                              f"完整内容已通过剪贴板获取")
-
-                        print(f"  [{req_id}] ✅ 完成: {yielded_len} 字符 "
-                              f"(DOM: {confirm_len}, clip: {len(clip_text) if clip_text else 0})")
+                        print(f"  [#{req_id}] ✅ 完成: {yielded_len} 字 "
+                              f"(dom={final_len} clip={len(clip_text) if clip_text else 0})")
                         break
 
-                # ---- 无进展检测 ----
-                if dom_len == prev_dom_len:
+                # ── 无进展检测 ──
+                if dom_len == prev_len:
                     no_change_count += 1
                 else:
                     no_change_count = 0
-                    prev_dom_len = dom_len
+                    prev_len = dom_len
 
-                # 长时间无新数据
                 if no_change_count > int(90 / poll_interval):
-                    if generation_started and best_text:
+                    if gen_started and best_text:
                         if len(best_text) > yielded_len:
                             yield best_text[yielded_len:]
-                        print(f"  [{req_id}] ⏰ 90秒无进展，完成: {len(best_text)} 字符")
+                        print(f"  [#{req_id}] ⏰ 90s 无进展: {len(best_text)} 字")
                         break
-                    elif not generation_started:
-                        if elapsed > 120:
-                            print(f"  [{req_id}] ❌ 120秒无响应")
-                            break
+                    elif not gen_started and elapsed > 120:
+                        print(f"  [#{req_id}] ❌ 120s 无响应")
+                        break
 
-                # ---- 定期日志 ----
-                if int(elapsed) > 0 and int(elapsed) % 15 == 0 and int(elapsed * 10) % 150 < 4:
-                    print(
-                        f"  [{req_id}] ⏳ {elapsed:.0f}s "
-                        f"dom={dom_len} think={think_len} "
-                        f"yielded={yielded_len} gen={is_gen} btn={has_button}"
-                    )
+                # ── 日志 ──
+                if scroll_counter % 37 == 0:  # ~15s
+                    print(f"  [#{req_id}] ⏳ {elapsed:.0f}s dom={dom_len} "
+                          f"think={think_len} out={yielded_len} "
+                          f"comp={is_complete} btn={btn_count}")
 
             # ═══════════════════════════════════════════
-            # 最终兜底
+            # 兜底
             # ═══════════════════════════════════════════
             if yielded_len == 0:
-                # 1. 尝试点复制按钮
-                print(f"  [{req_id}] 🔄 兜底: 尝试复制按钮...")
+                # 1) 点复制按钮
                 clip = await cp.click_copy_and_wait(timeout=5.0)
                 if clip and not _is_censored(clip):
                     yield clip
-                    print(f"  [{req_id}] 📋 兜底复制: {len(clip)} 字符")
+                    print(f"  [#{req_id}] 📋 兜底复制: {len(clip)} 字")
                     return
 
-                # 2. 尝试再读一次 DOM
+                # 2) 再读 DOM
                 await cp.scroll_to_bottom()
                 await asyncio.sleep(1)
-                state = await cp.read_state()
-                dom_text = state.get("domText", "")
-                if dom_text and not _is_censored(dom_text):
-                    yield dom_text
-                    print(f"  [{req_id}] 📋 兜底DOM: {len(dom_text)} 字符")
+                st = await cp.read_state()
+                dt = st.get("domText", "")
+                if dt and not _is_censored(dt):
+                    yield dt
+                    print(f"  [#{req_id}] 📋 兜底DOM: {len(dt)} 字")
                     return
 
-                # 3. 用快照
+                # 3) 快照
                 if best_text:
                     yield best_text
-                    print(f"  [{req_id}] 📋 兜底快照: {len(best_text)} 字符")
+                    print(f"  [#{req_id}] 📋 兜底快照: {len(best_text)} 字")
                     return
 
                 yield "抱歉，未能获取到响应。请稍后重试。"
-                print(f"  [{req_id}] ❌ 完全无响应")
+                print(f"  [#{req_id}] ❌ 完全无响应")
 
         except Exception as e:
-            print(f"  [{req_id}] ❌ {e}")
+            print(f"  [#{req_id}] ❌ {e}")
             import traceback
             traceback.print_exc()
             yield f"[错误] {str(e)}"
@@ -892,20 +807,14 @@ class BrowserManager:
         return False
 
     async def get_status(self) -> dict:
-        alive_count = 0
-        busy_count = 0
-        for cp in self._pages:
-            if await cp.is_alive():
-                alive_count += 1
-            if cp.busy:
-                busy_count += 1
-
+        alive_count = sum(1 for cp in self._pages if not cp.page.is_closed())
+        busy_count = sum(1 for cp in self._pages if cp.busy)
         return {
             "browser_alive": alive_count > 0,
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "dom-poll-clipboard-v2",
+            "mode": "dom-poll+clipboard-v3",
             "has_token": True,
             "cookie_count": 0,
             "page_count": len(self._pages),
@@ -939,25 +848,15 @@ class BrowserManager:
                         random.randint(100, 1800),
                         random.randint(100, 900),
                     )
-                    await cp.page.evaluate("""
-                        () => {
-                            document.dispatchEvent(new MouseEvent(
-                                'mousemove', {
-                                    clientX: Math.random() * window.innerWidth,
-                                    clientY: Math.random() * window.innerHeight
-                                }
-                            ));
-                        }
-                    """)
             except Exception:
                 pass
 
-        # 定期重新安装收集器
+        # 定期重装 hook
         if self.heartbeat_count % 5 == 0:
             for cp in self._pages:
                 if not cp.busy:
                     try:
-                        await cp.ensure_collector()
+                        await cp.ensure_clipboard_hook()
                     except Exception:
                         pass
 
@@ -971,7 +870,9 @@ class BrowserManager:
             self._save_camoufox_cache()
             if self.context:
                 await self.context.close()
-            if self.browser:
+            if self._camoufox_ctx:
+                await self._camoufox_ctx.__aexit__(None, None, None)
+            elif self.browser:
                 await self.browser.close()
             if self.playwright:
                 await self.playwright.stop()
