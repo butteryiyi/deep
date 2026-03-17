@@ -1,5 +1,5 @@
 
-# DeepSeek Proxy
+# Deep
 
 本项目提供一个基于浏览器的 DeepSeek 聊天代理服务，通过 Playwright 控制真实浏览器与 DeepSeek 网页交互，并对外提供兼容 OpenAI 格式的 HTTP 和 WebSocket 接口。采用 **Cookie 注入** 认证，无需账号密码，只需在本地手动登录一次并导出认证数据，即可在服务器端复用会话。
 
