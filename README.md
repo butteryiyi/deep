@@ -256,6 +256,7 @@ curl -X POST http://localhost:7860/v1/chat/completions \
 | `DEEPSEEK_LOCAL_STORAGE` | localStorage 对象 JSON | 无 |
 | `API_SECRET_KEY` | API 密钥，用于接口鉴权 | `zxcvbnm` |
 | `HEADLESS` | 是否以无头模式运行浏览器（本地调试时可设为 `false`） | `true` |
+| `MAX_CONCURRENT_PAGES` | 控制同时可用的浏览器页面（Tab）数量，默认为3，如果你的服务器内存小，建议调小，一个页面预留300mb | `3` |
 
 > **优先级**：`DEEPSEEK_AUTH` > `DEEPSEEK_TOKEN` > `DEEPSEEK_COOKIES` > 本地文件 `deepseek_auth.json`
 
