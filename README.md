@@ -132,6 +132,35 @@ python -m playwright install firefox   # 安装 Firefox（用于运行服务）
 访问 `http://localhost:7860` 查看状态页，或直接调用 API（见下文）。
 
 ---
+### 三、在 ClawCloud 上部署（推荐）
+
+[ClawCloud](https://clawcloud.com) 提供了简单易用的容器部署服务。你可以使用我们预先构建的 Docker 镜像快速启动。
+
+#### 1. 准备认证数据
+按照上面的“本地导出详细步骤”获取 `DEEPSEEK_AUTH` 的 JSON 字符串。
+
+#### 2. 在 ClawCloud 控制台创建应用
+- 登录 ClawCloud，进入容器部署服务。
+- 点击“创建应用”，填写应用名称。
+- **镜像地址**：填写 `ghcr.io/butteryiyi/deep:latest`
+- **资源配置**：
+  - CPU：**0.5 核**
+  - 内存：**1 GB**（足以流畅运行）
+- **环境变量**（必须设置）：
+  - `DEEPSEEK_AUTH`：粘贴完整的 JSON 字符串
+  - `API_SECRET_KEY`：自定义 API 密钥（例如 `sk-123456`）
+  - （可选）`HEADLESS`：默认为 `true`，无需修改
+- **端口映射**：容器内端口为 `7860`，对外暴露端口可根据需要设置（通常自动分配）
+
+#### 3. 部署并访问
+点击“部署”，等待启动完成。应用运行后，你会获得一个外部访问地址（如 `https://your-app.clawcloud.com`），通过该地址即可使用服务。
+
+> 💡 为什么推荐 ClawCloud？
+> - 无需自己构建镜像，直接使用预构建版本
+> - 资源配置灵活，0.5 核 + 1GB 内存足够运行浏览器代理
+> - 启动速度快，免去 Playwright 浏览器安装时间
+
+---
 
 ## 📡 API 使用说明
 
