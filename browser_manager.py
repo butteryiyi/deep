@@ -98,59 +98,121 @@ READ_STATE_JS = """
     const lastItem = items[items.length - 1];
     const itemClass = lastItem.className || '';
 
-    // ══ 完成检测 ══
-    // 探针发现: 生成中 className="_4f9bf79 d7dc56a8"
-    //           完成后 className="_4f9bf79 d7dc56a8 _43c05b5"
     R.isComplete = itemClass.includes('_43c05b5');
 
-    // ══ 消息容器 ══
     const msgDiv = lastItem.querySelector('div.ds-message');
     if (!msgDiv) return R;
 
-    // ══ 正式回复: ds-message 的直接子代 ds-markdown ══
-    // 探针确认: 正式回复 = div.ds-message > div.ds-markdown
-    //          思考区域 = div.ds-message > div._74c0879 > div.ds-think-content > div.ds-markdown
+    let replyMd = null;
     const directChildren = msgDiv.children;
     for (let i = directChildren.length - 1; i >= 0; i--) {
         const child = directChildren[i];
         if (child.tagName === 'DIV' &&
             child.classList.contains('ds-markdown') &&
             !child.classList.contains('ds-think-content')) {
-            R.domText = child.innerText || '';
-            R.domLen = R.domText.length;
+            replyMd = child;
             break;
         }
     }
 
-    // ══ 思考区域 ══
+    if (replyMd) {
+        const excludeSet = new Set();
+        const cites = replyMd.querySelectorAll('span.ds-markdown-cite');
+        for (let i = 0; i < cites.length; i++) {
+            const parentA = cites[i].closest('a');
+            excludeSet.add(parentA || cites[i]);
+        }
+        const searchBars = replyMd.querySelectorAll('.ffdab56b, .ddbfd84f');
+        for (let i = 0; i < searchBars.length; i++) {
+            excludeSet.add(searchBars[i]);
+        }
+
+        const BLOCK_TAGS = new Set([
+            'P','DIV','H1','H2','H3','H4','H5','H6',
+            'LI','OL','UL','BLOCKQUOTE','PRE','HR','TABLE',
+            'TR','THEAD','TBODY','BR'
+        ]);
+
+        const walker = document.createTreeWalker(
+            replyMd,
+            NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+            {
+                acceptNode: function(node) {
+                    // 元素节点：排除集合命中则 REJECT（跳过整个子树）
+                    if (node.nodeType === 1 && excludeSet.has(node)) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            }
+        );
+
+        const parts = [];
+        let lastWasBlock = false;
+        let node;
+
+        while (node = walker.nextNode()) {
+            if (node.nodeType === 1) {
+                if (BLOCK_TAGS.has(node.tagName)) {
+                    // 【修改】块级元素前：只在已有内容且上一个不是块时加换行
+                    if (parts.length > 0 && !lastWasBlock) {
+                        parts.push('\\n');
+                    }
+                    lastWasBlock = true;
+                    if (node.tagName === 'BR') {
+                        parts.push('\\n');
+                    }
+                    // 【新增】列表项前加符号
+                    if (node.tagName === 'LI') {
+                        const parent = node.parentElement;
+                        if (parent && parent.tagName === 'OL') {
+                            // 有序列表：计算序号
+                            const idx = Array.from(parent.children)
+                                .filter(c => c.tagName === 'LI')
+                                .indexOf(node) + 1;
+                            parts.push(idx + '. ');
+                        } else {
+                            parts.push('• ');
+                        }
+                    }
+                }
+            } else if (node.nodeType === 3) {
+                const t = node.textContent;
+                if (t && t.length > 0) {
+                    parts.push(t);
+                    lastWasBlock = false;
+                }
+            }
+        }
+
+        let text = parts.join('');
+        text = text.replace(/\\n{3,}/g, '\\n\\n');
+        text = text.replace(/^\\n+/, '');
+
+        R.domText = text.trim();
+        R.domLen = R.domText.length;
+    }
+
     const thinkDiv = msgDiv.querySelector('div.ds-think-content');
     if (thinkDiv) {
         const thinkMd = thinkDiv.querySelector('div.ds-markdown');
         if (thinkMd) {
-            R.thinkLen = (thinkMd.innerText || '').length;
+            R.thinkLen = (thinkMd.textContent || '').length;
         }
     }
 
-    // ══ 按钮 ══
-    // 探针确认: 按钮在 div.ds-flex._965abe9 > div.ds-icon-button
-    // 完成后有5个按钮（复制、重试、点赞、点踩、分享）
     const btnContainer = lastItem.querySelector('div._965abe9');
     if (btnContainer) {
         const btns = btnContainer.querySelectorAll('div.ds-icon-button');
         R.buttonCount = btns.length;
         R.hasButton = btns.length > 0;
     } else {
-        // 备选: 直接找
         const btns = lastItem.querySelectorAll('div.ds-icon-button');
         R.buttonCount = btns.length;
-        R.hasButton = btns.length >= 3;  // 至少3个才算有功能按钮（排除用户消息的2个）
+        R.hasButton = btns.length >= 3;
     }
 
-    // ══ 生成中检测 ══
-    // 方法1: _43c05b5 类名检测（最可靠）
     R.isGenerating = !R.isComplete && R.itemCount >= 2;
-
-    // 方法2: 检查是否有"正在思考"动画
     if (!R.isGenerating) {
         const thinkAnim = lastItem.querySelector('span.e4b3a110');
         if (thinkAnim) {
@@ -161,7 +223,6 @@ READ_STATE_JS = """
         }
     }
 
-    // ══ 剪贴板 ══
     if (window.__clipData) {
         R.clipText = window.__clipData.text || '';
         R.clipLen = R.clipText.length;
@@ -170,6 +231,7 @@ READ_STATE_JS = """
     return R;
 }
 """
+
 
 # 点击复制按钮
 # 探针确认: 复制按钮 = _965abe9 容器内第一个 ds-icon-button
