@@ -70,6 +70,24 @@ async def ensure_browser_ready():
     if not await browser_mgr.is_alive():
         raise HTTPException(status_code=503, detail="浏览器会话已断开")
 
+    # ═══ 新增：请求到达时检查登录状态 ═══
+    if not browser_mgr.logged_in:
+        print("  ⚠️ 请求到达但未登录，尝试重新登录...")
+        success = await browser_mgr.re_login()
+        if not success:
+            raise HTTPException(
+                status_code=503,
+                detail="登录状态失效且重新登录失败，请更新 Cookie"
+            )
+
+    # 轻量检查（不是每次都做深度检查，只在 logged_in 标记为 True 时做抽查）
+    # 每 20 个请求做一次深度检查
+    if browser_mgr.total_requests % 20 == 0:
+        is_ok = await browser_mgr.check_login_status()
+        if not is_ok:
+            print("  ⚠️ 抽查发现登录失效，尝试重新登录...")
+    
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
