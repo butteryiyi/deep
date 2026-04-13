@@ -990,6 +990,174 @@ class BrowserManager:
                 yield ("final", dt, None)
             else:
                 yield ("error", "抱歉，未能获取到响应。请稍后重试。", "no_response")
+    # ═══════════════════════════════════════════════════════════════
+    # 登录状态检测 & 自动重登录
+    # ═══════════════════════════════════════════════════════════════
+
+    async def check_login_status(self) -> bool:
+        """检查当前是否仍处于登录状态"""
+        for cp in self._pages:
+            if cp.busy:
+                continue
+            try:
+                if cp.page.is_closed():
+                    continue
+
+                result = await cp.page.evaluate("""
+                    () => {
+                        const url = window.location.href;
+
+                        if (url.includes('sign_in') || url.includes('/login')) {
+                            return { logged_in: false, reason: 'redirected_to_login', url: url };
+                        }
+
+                        if (!url.includes('deepseek.com')) {
+                            return { logged_in: false, reason: 'not_on_deepseek', url: url };
+                        }
+
+                        const textarea = document.querySelector('textarea');
+                        const sidebar = document.querySelector('[class*="sidebar"]');
+                        const chatArea = document.querySelector('[class*="chat"]');
+
+                        const loginBtns = document.querySelectorAll(
+                            'a[href*="login"], a[href*="sign_in"], ' +
+                            'button[class*="login"], button[class*="sign"]'
+                        );
+                        const bodyText = document.body ? (document.body.innerText || '') : '';
+                        const hasLoginPrompt = bodyText.includes('登录') && bodyText.includes('注册');
+                        const hasLogoutUI = loginBtns.length > 0 && !textarea;
+
+                        if (hasLogoutUI || (hasLoginPrompt && !textarea)) {
+                            return { logged_in: false, reason: 'login_ui_detected', url: url };
+                        }
+
+                        if (textarea || sidebar || chatArea) {
+                            return { logged_in: true, reason: 'chat_elements_found', url: url };
+                        }
+
+                        return { logged_in: false, reason: 'no_chat_elements', url: url };
+                    }
+                """)
+
+                logged_in = result.get("logged_in", False)
+                reason = result.get("reason", "unknown")
+                url = result.get("url", "")
+
+                if not logged_in:
+                    print(f"  🔍 登录检查：未登录 (原因: {reason}, URL: {url[:80]})")
+                return logged_in
+
+            except Exception as e:
+                print(f"  ⚠️ 登录状态检查异常 (页面#{cp.page_id}): {e}")
+                continue
+
+        print("  ⚠️ 无法检查登录状态（所有页面忙），假定已登录")
+        return True
+
+    async def re_login(self) -> bool:
+        """重新注入 Cookie 并刷新所有页面以恢复登录状态"""
+        print("\n🔄 ========== 开始重新登录流程 ==========")
+
+        target_cp = None
+        is_temp = False
+
+        for cp in self._pages:
+            if not cp.busy:
+                try:
+                    if not cp.page.is_closed():
+                        target_cp = cp
+                        break
+                except Exception:
+                    continue
+
+        if not target_cp:
+            print("  ⚠️ 所有页面都忙，尝试新建临时页面...")
+            try:
+                temp_page = await self.context.new_page()
+                target_cp = ChatPage(temp_page, 99)
+                is_temp = True
+            except Exception as e:
+                print(f"  ❌ 无法创建临时页面: {e}")
+                return False
+
+        try:
+            auth = AuthHandler(target_cp.page, context=self.context)
+            success = await auth.login(self.email, self.password)
+
+            if success:
+                self.logged_in = True
+                print("  ✅ Cookie 重新注入成功！")
+
+                await asyncio.sleep(1)
+                for cp in self._pages:
+                    if cp.page_id == target_cp.page_id or cp.busy:
+                        continue
+                    try:
+                        if cp.page.is_closed():
+                            continue
+                        await cp.page.reload(
+                            wait_until="domcontentloaded", timeout=30000
+                        )
+                        await asyncio.sleep(2)
+                        cp._hook_installed = False
+                        await cp.ensure_clipboard_hook()
+                        print(f"  ✅ 页面#{cp.page_id} 已刷新")
+                    except Exception as e:
+                        print(f"  ⚠️ 刷新页面#{cp.page_id} 失败: {e}")
+
+                if not is_temp:
+                    target_cp._hook_installed = False
+                    await target_cp.ensure_clipboard_hook()
+
+                print("🔄 ========== 重新登录完成 ==========\n")
+                return True
+            else:
+                self.logged_in = False
+                print("  ❌ 重新登录失败，Cookie 可能已完全过期。")
+                print("🔄 ========== 重新登录失败 ==========\n")
+                return False
+
+        except Exception as e:
+            print(f"  ❌ 重新登录异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+        finally:
+            if is_temp and target_cp:
+                try:
+                    await target_cp.page.close()
+                except Exception:
+                    pass
+
+    async def refresh_idle_pages(self) -> int:
+        """刷新所有空闲页面以保持前端 SPA 状态"""
+        refreshed = 0
+        for cp in self._pages:
+            if cp.busy:
+                continue
+            try:
+                if cp.page.is_closed():
+                    continue
+
+                current_url = cp.page.url or ""
+                if "deepseek.com" not in current_url:
+                    await cp.page.goto(
+                        "https://chat.deepseek.com/",
+                        wait_until="domcontentloaded", timeout=30000,
+                    )
+                else:
+                    await cp.page.reload(
+                        wait_until="domcontentloaded", timeout=30000
+                    )
+                await asyncio.sleep(2)
+                cp._hook_installed = False
+                await cp.ensure_clipboard_hook()
+                refreshed += 1
+            except Exception as e:
+                print(f"  ⚠️ 刷新页面#{cp.page_id} 失败: {e}")
+        return refreshed
+
 
     async def is_alive(self) -> bool:
         if not self._ready or not self._pages:
@@ -1038,205 +1206,8 @@ class BrowserManager:
                 continue
         return None
 
-
-        # ═══════════════════════════════════════════════════════════════
-    # 登录状态检测 & 自动重登录（新增）
-    # ═══════════════════════════════════════════════════════════════
-
-    async def check_login_status(self) -> bool:
-        """
-        在一个空闲页面上检测当前是否仍处于登录状态。
-        检测方式：
-        1. URL 是否跳转到了 login/sign_in
-        2. 页面上是否还有聊天界面元素（textarea、侧边栏等）
-        3. Cookie 中关键 token 是否还存在
-        """
-        for cp in self._pages:
-            if cp.busy:
-                continue
-            try:
-                if cp.page.is_closed():
-                    continue
-
-                result = await cp.page.evaluate("""
-                    () => {
-                        const url = window.location.href;
-                        
-                        // 检查1：是否被重定向到登录页
-                        if (url.includes('sign_in') || url.includes('/login')) {
-                            return { logged_in: false, reason: 'redirected_to_login', url: url };
-                        }
-                        
-                        // 检查2：是否在 about:blank 或其他非 DeepSeek 页面
-                        if (!url.includes('deepseek.com')) {
-                            return { logged_in: false, reason: 'not_on_deepseek', url: url };
-                        }
-                        
-                        // 检查3：页面上是否有聊天界面的关键元素
-                        const textarea = document.querySelector('textarea');
-                        const sidebar = document.querySelector('[class*="sidebar"]');
-                        const chatArea = document.querySelector('[class*="chat"]');
-                        const newChatBtn = document.querySelector('[class*="new-chat"]');
-                        
-                        // 检查是否有登录/注册按钮（说明未登录）
-                        const loginBtns = document.querySelectorAll(
-                            'a[href*="login"], a[href*="sign_in"], ' +
-                            'button[class*="login"], button[class*="sign"]'
-                        );
-                        const bodyText = document.body ? (document.body.innerText || '') : '';
-                        const hasLoginPrompt = bodyText.includes('登录') && bodyText.includes('注册');
-                        const hasLogoutUI = loginBtns.length > 0 && !textarea;
-                        
-                        if (hasLogoutUI || (hasLoginPrompt && !textarea)) {
-                            return { logged_in: false, reason: 'login_ui_detected', url: url };
-                        }
-                        
-                        // 有 textarea 或 sidebar → 已登录
-                        if (textarea || sidebar || chatArea) {
-                            return { logged_in: true, reason: 'chat_elements_found', url: url };
-                        }
-                        
-                        // 页面可能还在加载
-                        return { logged_in: false, reason: 'no_chat_elements', url: url };
-                    }
-                """)
-
-                logged_in = result.get("logged_in", False)
-                reason = result.get("reason", "unknown")
-                url = result.get("url", "")
-
-                if not logged_in:
-                    print(f"  🔍 登录检查：未登录 (原因: {reason}, URL: {url[:80]})")
-                return logged_in
-
-            except Exception as e:
-                print(f"  ⚠️ 登录状态检查异常 (页面#{cp.page_id}): {e}")
-                continue
-
-        # 所有页面都忙或异常，保守返回 True 避免误判
-        print("  ⚠️ 无法检查登录状态（所有页面忙），假定已登录")
-        return True
-
-    async def re_login(self) -> bool:
-        """
-        重新注入 Cookie 并刷新所有页面以恢复登录状态。
-        """
-        print("\n🔄 ========== 开始重新登录流程 ==========")
-
-        # 找一个空闲页面执行重新登录
-        target_cp = None
-        for cp in self._pages:
-            if not cp.busy:
-                try:
-                    if not cp.page.is_closed():
-                        target_cp = cp
-                        break
-                except Exception:
-                    continue
-
-        if not target_cp:
-            # 所有页面都忙，尝试新建一个临时页面
-            print("  ⚠️ 所有页面都忙，尝试新建临时页面...")
-            try:
-                temp_page = await self.context.new_page()
-                target_cp = ChatPage(temp_page, 99)
-            except Exception as e:
-                print(f"  ❌ 无法创建临时页面: {e}")
-                return False
-
-        try:
-            # 重新执行 Cookie 注入登录
-            auth = AuthHandler(target_cp.page, context=self.context)
-            success = await auth.login(self.email, self.password)
-
-            if success:
-                self.logged_in = True
-                print("  ✅ Cookie 重新注入成功！")
-
-                # 刷新其他空闲页面
-                await asyncio.sleep(1)
-                for cp in self._pages:
-                    if cp.page_id == target_cp.page_id or cp.busy:
-                        continue
-                    try:
-                        if cp.page.is_closed():
-                            continue
-                        await cp.page.reload(
-                            wait_until="domcontentloaded", timeout=30000
-                        )
-                        await asyncio.sleep(2)
-                        cp._hook_installed = False
-                        await cp.ensure_clipboard_hook()
-                        print(f"  ✅ 页面#{cp.page_id} 已刷新")
-                    except Exception as e:
-                        print(f"  ⚠️ 刷新页面#{cp.page_id} 失败: {e}")
-
-                # 确保目标页面的 hook 也装好
-                target_cp._hook_installed = False
-                await target_cp.ensure_clipboard_hook()
-
-                print("🔄 ========== 重新登录完成 ==========\n")
-                return True
-            else:
-                self.logged_in = False
-                print("  ❌ 重新登录失败，Cookie 可能已完全过期。")
-                print("     请重新运行 export_cookies.py 获取新 Cookie，")
-                print("     或更新 DEEPSEEK_AUTH 环境变量。")
-                print("🔄 ========== 重新登录失败 ==========\n")
-                return False
-
-        except Exception as e:
-            print(f"  ❌ 重新登录异常: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-        finally:
-            # 清理临时页面
-            if target_cp and target_cp.page_id == 99:
-                try:
-                    await target_cp.page.close()
-                except Exception:
-                    pass
-
-    async def refresh_idle_pages(self) -> int:
-        """
-        刷新所有空闲页面以保持前端 SPA 状态新鲜。
-        返回成功刷新的页面数。
-        """
-        refreshed = 0
-        for cp in self._pages:
-            if cp.busy:
-                continue
-            try:
-                if cp.page.is_closed():
-                    continue
-
-                current_url = cp.page.url or ""
-                # 只刷新在 DeepSeek 域名下的页面
-                if "deepseek.com" not in current_url:
-                    await cp.page.goto(
-                        "https://chat.deepseek.com/",
-                        wait_until="domcontentloaded", timeout=30000,
-                    )
-                else:
-                    await cp.page.reload(
-                        wait_until="domcontentloaded", timeout=30000
-                    )
-                await asyncio.sleep(2)
-                cp._hook_installed = False
-                await cp.ensure_clipboard_hook()
-                refreshed += 1
-            except Exception as e:
-                print(f"  ⚠️ 刷新页面#{cp.page_id} 失败: {e}")
-        return refreshed
-
-
-        async def simulate_activity(self):
-        """
-        模拟用户活动：鼠标移动 + 偶尔滚动 + 偶尔点击空白区域。
-        比原来只移动鼠标更真实，能更好地保持前端心跳。
-        """
+    async def simulate_activity(self):
+        """模拟用户活动：鼠标移动 + 可见性欺骗 + 轻量网络请求保持 session"""
         import random
         self.heartbeat_count += 1
 
@@ -1245,20 +1216,16 @@ class BrowserManager:
                 if cp.page.is_closed() or cp.busy:
                     continue
 
-                # 基础：移动鼠标
                 await cp.page.mouse.move(
                     random.randint(100, 1800),
                     random.randint(100, 900),
                 )
 
-                # 每 3 次心跳：模拟滚动（触发前端的交互监听器）
                 if self.heartbeat_count % 3 == 0:
                     await cp.page.evaluate("""
                         () => {
-                            // 触发一个小滚动来保持页面活跃
                             window.dispatchEvent(new Event('mousemove'));
                             window.dispatchEvent(new Event('focus'));
-                            // 可视性 API：告诉页面它是活跃的
                             try {
                                 Object.defineProperty(document, 'hidden', {
                                     get: () => false, configurable: true
@@ -1271,12 +1238,10 @@ class BrowserManager:
                         }
                     """)
 
-                # 每 6 次心跳：触发一次网络级心跳（fetch 一个轻量 API 保持 cookie 活跃）
                 if self.heartbeat_count % 6 == 0:
                     await cp.page.evaluate("""
                         () => {
                             try {
-                                // 轻量请求保持 session 活跃
                                 fetch('/api/v0/users/current', {
                                     method: 'GET',
                                     credentials: 'include'
@@ -1288,7 +1253,6 @@ class BrowserManager:
             except Exception:
                 pass
 
-        # 定期重装 clipboard hook
         if self.heartbeat_count % 5 == 0:
             for cp in self._pages:
                 if not cp.busy:
@@ -1297,7 +1261,6 @@ class BrowserManager:
                     except Exception:
                         pass
 
-        # 定期日志
         if self.heartbeat_count % 10 == 0:
             alive = 0
             for cp in self._pages:
@@ -1307,9 +1270,7 @@ class BrowserManager:
                 except Exception:
                     pass
             busy = sum(1 for cp in self._pages if cp.busy)
-            print(f"💓 #{self.heartbeat_count} "
-                  f"({alive}活/{busy}忙) 登录={self.logged_in}")
-
+            print(f"💓 #{self.heartbeat_count} ({alive}活/{busy}忙) 登录={self.logged_in}")
 
     async def shutdown(self):
         try:
@@ -1325,3 +1286,4 @@ class BrowserManager:
             print("🔒 已关闭")
         except Exception as e:
             print(f"⚠️ {e}")
+
