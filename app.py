@@ -11,6 +11,7 @@ import asyncio
 import time
 from datetime import datetime
 from contextlib import asynccontextmanager
+from browser_manager import BrowserManager, HEARTBEAT_MARKER
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -308,7 +309,7 @@ async def chat_completions(request: Request):
     if stream:
         async def generate():
             async for chunk in browser_mgr.send_message_stream(user_prompt):
-                # ★ 心跳标记：发 SSE 注释保活，客户端会忽略
+                # ★ 心跳标记：发 SSE 注释保活
                 if chunk == HEARTBEAT_MARKER:
                     yield ": heartbeat\n\n"
                     continue
@@ -340,9 +341,19 @@ async def chat_completions(request: Request):
                 }]
             }
             yield f"data: {json.dumps(end_data, ensure_ascii=False)}\n\n"
-            yield "data:\n\n"
+            yield "data: [DONE]\n\n"
 
-        return StreamingResponse(generate(), media_type="text/event-stream")
+        # ═══ 关键改动：加反缓冲头 ═══
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "X-Accel-Buffering": "no",           # ★ Nginx 禁止缓冲
+                "Connection": "keep-alive",
+                "Transfer-Encoding": "chunked",
+            },
+        )
     else:
         response_text = await browser_mgr.send_message(user_prompt)
         return {
@@ -361,7 +372,6 @@ async def chat_completions(request: Request):
                 "total_tokens": len(user_prompt) + len(response_text)
             }
         }
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -419,7 +429,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_json({"type": "start"})
             full_response = ""
             async for chunk in browser_mgr.send_message_stream(message):
-                # ★ 心跳标记：WebSocket 发 ping 类型消息，不当内容处理
+                # ★ 心跳标记
                 if chunk == HEARTBEAT_MARKER:
                     await websocket.send_json({"type": "heartbeat"})
                     continue
