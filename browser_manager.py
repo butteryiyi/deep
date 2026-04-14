@@ -1,7 +1,8 @@
 # browser_manager.py
 # 策略：生成中只监控+保存快照，完成后点复制按钮拿原生 Markdown
-# DOM 纯文本仅用于：实时流式输出保活、审查检测、长度监控、兜底
-# v5: 增加服务器错误检测 + 自动重试 + 页面恢复 + 真正的实时流输出避免客户端空回超时
+# DOM 纯文本仅用于：审查检测、长度监控、兜底
+# v6: 回归旧版稳定发送模式（非流式积攒） + SSE心跳保活解决超时
+#     保留：服务器错误检测 + 自动重试 + 页面恢复 + 登录检测/重登录
 
 import os
 import sys
@@ -62,6 +63,9 @@ def _is_censored(text: str) -> bool:
     return False
 
 
+# ═══════════════════════════════════════════════════════════════
+# 剪贴板拦截（唯一注入的 JS）
+# ═══════════════════════════════════════════════════════════════
 INSTALL_CLIPBOARD_HOOK_JS = """
 () => {
     if (window.__clipHooked) return 'already';
@@ -82,6 +86,9 @@ INSTALL_CLIPBOARD_HOOK_JS = """
 }
 """
 
+# ═══════════════════════════════════════════════════════════════
+# 读取状态（轻量，只拿纯文本用于监控和审查检测）
+# ═══════════════════════════════════════════════════════════════
 READ_STATE_JS = """
 () => {
     const R = {
@@ -95,7 +102,6 @@ READ_STATE_JS = """
         itemCount: 0,
         errorText: '',
         hasError: false,
-        pageText: '',
     };
 
     const errorSelectors = [
@@ -147,11 +153,10 @@ READ_STATE_JS = """
         R.errorText += '(has-retry-btn) ';
     }
 
-    const allTextInLastItem = lastItemText;
     const errorKeywords = ['服务器繁忙', '请稍后重试', 'Server is busy', 'Network Error',
                            '网络错误', '出错了', 'Something went wrong', '请求过于频繁'];
     for (const kw of errorKeywords) {
-        if (allTextInLastItem.includes(kw)) {
+        if (lastItemText.includes(kw)) {
             R.hasError = true;
             R.errorText += kw + ' ';
         }
@@ -203,6 +208,7 @@ READ_STATE_JS = """
 }
 """
 
+# 点击复制按钮
 CLICK_COPY_JS = """
 () => {
     const items = document.querySelectorAll('div[data-virtual-list-item-key]');
@@ -238,6 +244,7 @@ CLICK_COPY_JS = """
 }
 """
 
+# 滚动到底部
 SCROLL_BOTTOM_JS = """
 () => {
     const sa = document.querySelector('.ds-scroll-area');
@@ -246,6 +253,7 @@ SCROLL_BOTTOM_JS = """
 }
 """
 
+# 点击"重新生成"按钮
 CLICK_REGENERATE_JS = """
 () => {
     const allBtns = document.querySelectorAll('button, div[role="button"], [class*="btn"], [class*="button"]');
@@ -340,6 +348,7 @@ class ChatPage:
             pass
 
     async def click_regenerate(self) -> str:
+        """点击重新生成按钮"""
         try:
             result = await self.page.evaluate(CLICK_REGENERATE_JS)
             return result
@@ -348,6 +357,7 @@ class ChatPage:
             return f"error:{e}"
 
     async def check_server_error(self) -> tuple[bool, str]:
+        """检查页面是否存在服务器错误提示"""
         try:
             state = await self.read_state()
             error_text = state.get("errorText", "")
@@ -456,6 +466,12 @@ class ChatPage:
             return False
 
 
+# ═══════════════════════════════════════════════════════════════
+# SSE 心跳标记 — 用于保活，不携带任何内容
+# ═══════════════════════════════════════════════════════════════
+HEARTBEAT_MARKER = ""
+
+
 class BrowserManager:
     def __init__(self):
         self.playwright = None
@@ -480,6 +496,7 @@ class BrowserManager:
         self._ready_event = asyncio.Event()
         self._camoufox_ctx = None
 
+        # 错误统计
         self._consecutive_errors = 0
         self._last_error_time = 0.0
 
@@ -652,6 +669,7 @@ class BrowserManager:
         self._page_semaphore.release()
 
     async def _recover_page(self, cp: ChatPage):
+        """恢复一个异常的页面到可用状态"""
         print(f"  🔄 正在恢复页面#{cp.page_id}...")
         try:
             if not await cp.is_alive():
@@ -677,39 +695,24 @@ class BrowserManager:
         except Exception as e:
             print(f"  ❌ 页面#{cp.page_id} 恢复失败: {e}")
 
+    # ═══════════════════════════════════════════════════════════════
+    # 非流式接口
+    # ═══════════════════════════════════════════════════════════════
     async def send_message(self, message: str) -> str:
-        """非流式：如果有最终补全的 Markdown 就返回，否则用分块拼接"""
-        final_text = ""
-        chunks_text = ""
-        async for chunk_type, content in self._send_message_internal(message):
-            if chunk_type == "chunk":
-                chunks_text += content
-            elif chunk_type in ("final", "error"):
-                final_text = content
-        return final_text if final_text else chunks_text
+        full = ""
+        async for chunk in self.send_message_stream(message):
+            if chunk != HEARTBEAT_MARKER:
+                full += chunk
+        return full
 
+    # ═══════════════════════════════════════════════════════════════
+    # 流式接口 — 回归旧版：生成中只发心跳保活，完成后一次性输出结果
+    # ═══════════════════════════════════════════════════════════════
     async def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
-        """流式：实时输出 chunk，审查时自动补发快照剩余内容"""
-        chunks_sent_total = 0
-        async for chunk_type, content in self._send_message_internal(message):
-            if chunk_type == "chunk":
-                if content:
-                    chunks_sent_total += len(content)
-                    yield content
-            elif chunk_type == "error":
-                if content:
-                    yield f"\n\n{content}"
-            elif chunk_type == "final":
-                # 仅当没有任何 chunk 发送过时，才输出 final（兜底安全网）
-                # 正常情况下反审查的剩余内容已经作为 chunk 补发了
-                if content and chunks_sent_total == 0:
-                    yield content
-
-    async def _send_message_internal(self, message: str) -> AsyncGenerator[tuple[str, str], None]:
         if not self._ready:
             ok = await self.wait_until_ready(timeout=180)
             if not ok:
-                yield "error", "[错误] 浏览器初始化超时"
+                yield "[错误] 浏览器初始化超时"
                 return
 
         self.total_requests += 1
@@ -721,145 +724,177 @@ class BrowserManager:
         try:
             cp = await asyncio.wait_for(self._acquire_page(), timeout=300)
         except (asyncio.TimeoutError, RuntimeError) as e:
-            yield "error", f"[错误] {e}"
+            yield f"[错误] {e}"
             return
 
         print(f"  [#{req_id}] → 页面#{cp.page_id}")
 
+        # ═══════════════════════════════════════════════════
+        # 支持重试的外层循环
+        # ═══════════════════════════════════════════════════
         max_retries = 2
         retry_count = 0
 
         try:
             while retry_count <= max_retries:
+                result = None
                 error_type = None
 
                 try:
-                    async for c_type, c_data, e_type in self._do_send_and_wait_gen(cp, message, req_id, retry_count):
-                        if e_type:
-                            error_type = e_type
-                            if c_data and c_type == "error":
-                                yield "error", c_data
+                    # 用一个 asyncio.Task 跑核心等待逻辑
+                    # 同时在这里定期 yield 心跳保活
+                    result_future = asyncio.get_event_loop().create_future()
+
+                    async def _run_core():
+                        try:
+                            r, e = await self._do_send_and_wait(
+                                cp, message, req_id, retry_count
+                            )
+                            result_future.set_result((r, e))
+                        except Exception as exc:
+                            result_future.set_exception(exc)
+
+                    task = asyncio.create_task(_run_core())
+
+                    # 每 8 秒发一次心跳，直到核心逻辑完成
+                    while not result_future.done():
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(result_future), timeout=8.0
+                            )
+                        except asyncio.TimeoutError:
+                            # 核心逻辑还没完成，发心跳保活
+                            yield HEARTBEAT_MARKER
+                            continue
+                        except Exception:
                             break
-                        
-                        if c_type in ("chunk", "final"):
-                            yield c_type, c_data
+
+                    # 拿结果
+                    if result_future.done():
+                        if result_future.exception():
+                            raise result_future.exception()
+                        result, error_type = result_future.result()
+                    else:
+                        await task
+                        result, error_type = result_future.result()
+
                 except Exception as e:
                     print(f"  [#{req_id}] ❌ 执行异常: {e}")
                     import traceback
                     traceback.print_exc()
-                    yield "error", f"[错误] {str(e)}"
+                    result = f"[错误] {str(e)}"
                     error_type = "exception"
-                    break
 
                 if error_type == "server_error" and retry_count < max_retries:
                     retry_count += 1
                     wait_time = 5 * retry_count
-                    print(f"  [#{req_id}] 🔄 服务器错误，{wait_time}s 后重试 ({retry_count}/{max_retries})...")
+                    print(f"  [#{req_id}] 🔄 服务器错误，{wait_time}s 后重试 "
+                          f"({retry_count}/{max_retries})...")
                     await asyncio.sleep(wait_time)
                     await self._recover_page(cp)
                     continue
+
                 elif error_type == "server_error":
                     self._consecutive_errors += 1
                     self._last_error_time = time.time()
-                    yield "error", "[错误] 服务器繁忙，多次重试后仍然失败，请稍后重试。"
+                    if result:
+                        yield result
+                    else:
+                        yield "[错误] 服务器繁忙，多次重试后仍然失败，请稍后重试。"
                     break
+
                 else:
                     if error_type is None:
                         self._consecutive_errors = 0
+                    if result:
+                        yield result
                     break
 
         finally:
             if cp:
                 self._release_page(cp)
 
-
-    async def _do_send_and_wait_gen(
+    # ═══════════════════════════════════════════════════════════════
+    # 核心等待逻辑 — 与旧版完全一致：只监控+保存快照，不输出任何内容
+    # ═══════════════════════════════════════════════════════════════
+    async def _do_send_and_wait(
         self, cp: ChatPage, message: str, req_id: int, retry_num: int
-    ) -> AsyncGenerator[tuple[str, str, Optional[str]], None]:
+    ) -> tuple[Optional[str], Optional[str]]:
         """
-        返回格式: yield (msg_type, content, error_type)
-        msg_type: "chunk" | "final" | "error"
-        
-        反审查策略：
-        - best_dom_text 持续保存最长快照
-        - 审查触发时，将 best_dom_text 中尚未 yield 的部分补发为 chunk
-        - 同时 yield "final" 供非流式调用者使用
+        执行发送消息并等待响应。
+        返回: (result_text, error_type)
+            error_type: None=成功, "server_error"=可重试, "no_response"=无响应
         """
         cp.request_count += 1
 
+        # 检查存活
         if not await cp.is_alive():
             print(f"  [#{req_id}] 页面死亡，恢复中...")
             await self._recover_page(cp)
             if not await cp.is_alive():
-                yield ("error", "[错误] 页面恢复失败", "exception")
-                return
+                return "[错误] 页面恢复失败", "exception"
 
+        # 新对话 + 安装 hook
         await cp.start_new_chat()
         await asyncio.sleep(0.5)
         await cp.ensure_clipboard_hook()
         await cp.reset_clip()
 
+        # 发送消息
         await cp.type_and_send(message)
         retry_tag = f" (重试#{retry_num})" if retry_num > 0 else ""
         print(f"  [#{req_id}] 已发送{retry_tag}")
 
+        # ═══════════════════════════════════════════════════
+        # 核心等待循环 — 只监控，不输出
+        # ═══════════════════════════════════════════════════
+
         max_wait = 600
         poll_interval = 0.4
         best_dom_text = ""
-        last_yielded_len = 0
         gen_started = False
         no_change_count = 0
         prev_len = 0
         start_ts = time.time()
         scroll_counter = 0
+        final_text = None
+        error_type = None
 
+        # DOM 归零检测
         dom_zero_count = 0
         dom_was_positive = False
         dom_zero_start_time = 0.0
 
-        # ── 等第二个 item 出现（AI 开始回复）──
+        # 等第二个 item 出现（AI 开始回复）
         for _ in range(60):
             await asyncio.sleep(0.5)
             st = await cp.read_state()
+
             has_err, err_msg = await cp.check_server_error()
             if has_err:
                 print(f"  [#{req_id}] ❌ 等待期间检测到服务器错误: {err_msg}")
-                yield ("error", f"[服务器错误] {err_msg}", "server_error")
-                return
+                return f"[服务器错误] {err_msg}", "server_error"
+
             if st.get("itemCount", 0) >= 2:
                 break
             if time.time() - start_ts > 30:
                 break
 
-        # ══════════════════════════════════════════════════
-        # 辅助：补发 best_dom_text 中尚未 yield 的剩余内容
-        # ══════════════════════════════════════════════════
-        def _calc_remaining():
-            """返回 best_dom_text 中尚未通过 chunk 发送的部分"""
-            nonlocal last_yielded_len
-            if len(best_dom_text) > last_yielded_len:
-                remaining = best_dom_text[last_yielded_len:]
-                last_yielded_len = len(best_dom_text)
-                return remaining
-            return ""
-
         while True:
             elapsed = time.time() - start_ts
             if elapsed > max_wait:
                 print(f"  [#{req_id}] ⏰ 超时 {max_wait}s")
-                # 超时也尝试补发剩余内容
-                remaining = _calc_remaining()
-                if remaining:
-                    yield ("chunk", remaining, None)
-                yield ("error", "[错误] 生成超时", "timeout")
-                return
+                error_type = "timeout"
+                break
 
             await asyncio.sleep(poll_interval)
             scroll_counter += 1
 
+            # 定期滚动到底部
             if scroll_counter % 12 == 0:
                 await cp.scroll_to_bottom()
 
+            # 读状态
             state = await cp.read_state()
             dom_text = state.get("domText", "")
             dom_len = state.get("domLen", 0)
@@ -871,48 +906,41 @@ class BrowserManager:
             has_error = state.get("hasError", False)
             error_text = state.get("errorText", "")
 
-            # ═══════════════════════════════════════════
-            # 实时增量流输出（只要有新字符就发）
-            # ═══════════════════════════════════════════
-            if dom_len > last_yielded_len:
-                chunk = dom_text[last_yielded_len:dom_len]
-                last_yielded_len = dom_len
-                yield ("chunk", chunk, None)
-
-            # ═══════════════════════════════════════════
-            # 服务器错误检测
-            # ═══════════════════════════════════════════
+            # ══ 服务器错误检测 ══
             if has_error:
                 print(f"  [#{req_id}] ❌ 检测到服务器错误: {error_text}")
-                remaining = _calc_remaining()
-                if remaining:
-                    yield ("chunk", remaining, None)
-                msg = "[注意：响应可能不完整，服务器中途报错]" if best_dom_text else "[错误] 服务器报错"
-                yield ("error", msg, "server_error")
-                return
+                if best_dom_text:
+                    final_text = best_dom_text + "\n\n[注意：响应可能不完整，服务器中途报错]"
+                    error_type = "server_error"
+                else:
+                    final_text = None
+                    error_type = "server_error"
+                break
 
             if scroll_counter % 15 == 0:
                 deep_has_err, deep_err_msg = await cp.check_server_error()
                 if deep_has_err:
                     print(f"  [#{req_id}] ❌ 深度检查发现服务器错误: {deep_err_msg}")
-                    remaining = _calc_remaining()
-                    if remaining:
-                        yield ("chunk", remaining, None)
-                    msg = "[注意：响应可能不完整，服务器中途报错]" if best_dom_text else "[错误] 服务器深度报错"
-                    yield ("error", msg, "server_error")
-                    return
+                    if best_dom_text:
+                        final_text = best_dom_text + "\n\n[注意：响应可能不完整，服务器中途报错]"
+                        error_type = "server_error"
+                    else:
+                        final_text = None
+                        error_type = "server_error"
+                    break
 
             # 检测生成开始
             if not gen_started and (dom_len > 0 or think_len > 0 or is_gen):
                 gen_started = True
                 no_change_count = 0
-                print(f"  [#{req_id}] 🚀 开始 (think={think_len} reply={dom_len})")
+                print(f"  [#{req_id}] 🚀 开始 "
+                      f"(think={think_len} reply={dom_len})")
 
-            # 持续保存最长快照
+            # ══ 持续保存 DOM 纯文本快照 ══
             if dom_len > len(best_dom_text):
                 best_dom_text = dom_text
 
-            # DOM 归零检测
+            # ══ DOM 突然归零检测 ══
             if gen_started and dom_len > 0:
                 dom_was_positive = True
                 dom_zero_count = 0
@@ -922,116 +950,96 @@ class BrowserManager:
                 if dom_zero_count == 0:
                     dom_zero_start_time = time.time()
                 dom_zero_count += 1
+
                 if dom_zero_count >= int(10 / poll_interval):
+                    print(f"  [#{req_id}] ⚠️ DOM 归零已 "
+                          f"{time.time() - dom_zero_start_time:.0f}s，"
+                          f"主动检查错误...")
                     zero_has_err, zero_err_msg = await cp.check_server_error()
                     if zero_has_err:
-                        remaining = _calc_remaining()
-                        if remaining:
-                            yield ("chunk", remaining, None)
-                        msg = "[注意：响应可能不完整，服务器中途报错]" if best_dom_text else "[错误] DOM归零"
-                        yield ("error", msg, "server_error")
-                        return
+                        print(f"  [#{req_id}] ❌ DOM 归零确认为服务器错误: "
+                              f"{zero_err_msg}")
+                        if best_dom_text:
+                            final_text = (best_dom_text +
+                                          "\n\n[注意：响应可能不完整，服务器中途报错]")
+                        error_type = "server_error"
+                        break
                     elif dom_zero_count >= int(20 / poll_interval):
-                        remaining = _calc_remaining()
-                        if remaining:
-                            yield ("chunk", remaining, None)
-                        msg = "[注意：响应可能不完整，生成过程异常中断]" if best_dom_text else "[错误] DOM持续归零"
-                        yield ("error", msg, "server_error")
-                        return
+                        print(f"  [#{req_id}] ❌ DOM 持续归零 20s+，"
+                              f"判定为异常中断")
+                        if best_dom_text:
+                            final_text = (best_dom_text +
+                                          "\n\n[注意：响应可能不完整，生成过程异常中断]")
+                        error_type = "server_error"
+                        break
 
-            # ═══════════════════════════════════════════
-            # 🛡️ 核心反审查：生成中检测
-            # DOM 从1000字突变为22字的审查提示 → 补发快照剩余
-            # ═══════════════════════════════════════════
+            # ── 审查检测（生成中） ──
             if (gen_started and len(best_dom_text) > 80
                 and dom_text and dom_len < len(best_dom_text) * 0.4
                 and _is_censored(dom_text)):
                 print(f"  [#{req_id}] 🛡️ 生成中审查! "
-                      f"dom={dom_len} snap={len(best_dom_text)} "
-                      f"已发送={last_yielded_len}")
-                # ★ 关键修复：把快照中尚未发送的部分作为 chunk 补发
-                remaining = _calc_remaining()
-                if remaining:
-                    yield ("chunk", remaining, None)
-                    print(f"  [#{req_id}] 🛡️ 已补发 {len(remaining)} 字反审查内容")
-                # 同时 yield final 供非流式调用者使用
-                yield ("final", best_dom_text, None)
-                return
+                      f"dom={dom_len} snap={len(best_dom_text)}")
+                final_text = best_dom_text
+                break
 
-            # ═══════════════════════════════════════════
-            # 完成检测
-            # ═══════════════════════════════════════════
+            # ── 完成检测 ──
             if gen_started and is_complete and has_button and btn_count >= 3:
+                # 再确认一次
                 await asyncio.sleep(0.3)
                 confirm = await cp.read_state()
                 if not (confirm.get("isComplete") and confirm.get("hasButton")):
                     continue
 
+                # 完成时也检查错误
                 if confirm.get("hasError"):
                     err = confirm.get("errorText", "")
-                    remaining = _calc_remaining()
-                    if remaining:
-                        yield ("chunk", remaining, None)
-                    msg = "[注意：响应可能不完整]" if best_dom_text else err
-                    yield ("error", msg, "server_error")
-                    return
+                    print(f"  [#{req_id}] ❌ 完成时检测到错误: {err}")
+                    if best_dom_text:
+                        final_text = (best_dom_text +
+                                      "\n\n[注意：响应可能不完整]")
+                    error_type = "server_error"
+                    break
 
+                # 滚到底确保完整
                 await cp.scroll_to_bottom()
                 await asyncio.sleep(0.2)
                 final_state = await cp.read_state()
                 final_dom = final_state.get("domText", "")
                 final_dom_len = final_state.get("domLen", 0)
 
+                # 更新快照
                 if final_dom_len > len(best_dom_text):
                     best_dom_text = final_dom
 
-                # 补发遗漏的 DOM 增量
-                if final_dom_len > last_yielded_len:
-                    chunk = best_dom_text[last_yielded_len:final_dom_len]
-                    last_yielded_len = final_dom_len
-                    yield ("chunk", chunk, None)
-
-                # ═══════════════════════════════════════
-                # 🛡️ 完成时审查检测
-                # ═══════════════════════════════════════
-                if (_is_censored(final_dom)
-                    and len(best_dom_text) > final_dom_len * 2):
+                # ══ 检查完成时 DOM 是否已被审查替换 ══
+                if (_is_censored(final_dom) and
+                    len(best_dom_text) > final_dom_len * 2):
                     print(f"  [#{req_id}] 🛡️ 完成时已审查! "
-                          f"dom={final_dom_len} snap={len(best_dom_text)} "
-                          f"已发送={last_yielded_len}")
-                    # ★ 关键修复：补发快照剩余
-                    remaining = _calc_remaining()
-                    if remaining:
-                        yield ("chunk", remaining, None)
-                        print(f"  [#{req_id}] 🛡️ 已补发 {len(remaining)} 字")
-                    yield ("final", best_dom_text, None)
-                    return
+                          f"dom={final_dom_len} snap={len(best_dom_text)}")
+                    final_text = best_dom_text
+                    break
 
-                # 点复制按钮拿 Markdown
+                # ══ 点复制按钮拿 Markdown ══
                 clip_text = await cp.click_copy_and_wait(timeout=3.0)
 
                 if clip_text and not _is_censored(clip_text):
-                    print(f"  [#{req_id}] ✅ 完成: clip={len(clip_text)} dom={final_dom_len}")
-                    yield ("final", clip_text, None)
-
+                    final_text = clip_text
+                    print(f"  [#{req_id}] ✅ 完成: "
+                          f"clip={len(clip_text)} dom={final_dom_len}")
                 elif clip_text and _is_censored(clip_text):
-                    # ★ 剪贴板被审查，补发快照剩余
+                    final_text = best_dom_text
                     print(f"  [#{req_id}] 🛡️ 剪贴板被审查! "
-                          f"clip={len(clip_text)} snap={len(best_dom_text)} "
-                          f"已发送={last_yielded_len}")
-                    remaining = _calc_remaining()
-                    if remaining:
-                        yield ("chunk", remaining, None)
-                        print(f"  [#{req_id}] 🛡️ 已补发 {len(remaining)} 字")
-                    yield ("final", best_dom_text, None)
-
+                          f"clip={len(clip_text)} snap={len(best_dom_text)}")
                 else:
-                    final_text = (final_dom if (final_dom and not _is_censored(final_dom))
-                                  else best_dom_text)
-                    yield ("final", final_text, None)
-                return
+                    if final_dom and not _is_censored(final_dom):
+                        final_text = final_dom
+                    else:
+                        final_text = best_dom_text
+                    print(f"  [#{req_id}] ⚠️ 剪贴板为空, "
+                          f"用dom={len(final_text or '')}")
+                break
 
-            # 无进展检测
+            # ── 无进展检测 ──
             if dom_len == prev_len:
                 no_change_count += 1
             else:
@@ -1042,54 +1050,67 @@ class BrowserManager:
             if no_change_count > int(no_change_timeout / poll_interval):
                 nc_has_err, nc_err_msg = await cp.check_server_error()
                 if nc_has_err:
-                    remaining = _calc_remaining()
-                    if remaining:
-                        yield ("chunk", remaining, None)
-                    msg = "[注意：响应可能不完整，服务器中途报错]" if best_dom_text else "[错误] 无进展报错"
-                    yield ("error", msg, "server_error")
-                    return
+                    print(f"  [#{req_id}] ❌ 无进展期间发现服务器错误: "
+                          f"{nc_err_msg}")
+                    if best_dom_text:
+                        final_text = (best_dom_text +
+                                      "\n\n[注意：响应可能不完整，服务器中途报错]")
+                    error_type = "server_error"
+                    break
 
                 if gen_started and best_dom_text:
+                    final_text = best_dom_text
                     print(f"  [#{req_id}] ⏰ {no_change_timeout}s 无进展: "
                           f"{len(best_dom_text)} 字")
-                    remaining = _calc_remaining()
-                    if remaining:
-                        yield ("chunk", remaining, None)
-                    yield ("final", best_dom_text, None)
-                    return
+                    break
                 elif not gen_started and elapsed > 60:
                     nr_has_err, nr_err_msg = await cp.check_server_error()
                     if nr_has_err:
-                        yield ("error", f"[错误] 服务器错误: {nr_err_msg}", "server_error")
+                        print(f"  [#{req_id}] ❌ 长时间无响应+服务器错误: "
+                              f"{nr_err_msg}")
+                        error_type = "server_error"
                     else:
-                        yield ("error", "[错误] 60s无响应", "no_response")
-                    return
+                        print(f"  [#{req_id}] ❌ 60s 无响应")
+                        error_type = "no_response"
+                    break
 
+            # 日志
             if scroll_counter % 37 == 0:
                 err_info = f" err={error_text[:30]}" if error_text else ""
                 print(f"  [#{req_id}] ⏳ {elapsed:.0f}s "
                       f"dom={dom_len} think={think_len} "
-                      f"snap={len(best_dom_text)} sent={last_yielded_len} "
-                      f"comp={is_complete} btn={btn_count}{err_info}")
+                      f"snap={len(best_dom_text)} "
+                      f"comp={is_complete} btn={btn_count}"
+                      f"{err_info}")
 
-        # ── 循环结束兜底 ──
-        clip = await cp.click_copy_and_wait(timeout=5.0)
-        if clip and not _is_censored(clip):
-            yield ("final", clip, None)
-        elif best_dom_text:
-            remaining = _calc_remaining()
-            if remaining:
-                yield ("chunk", remaining, None)
-            yield ("final", best_dom_text, None)
+        # ═══════════════════════════════════════════
+        # 输出
+        # ═══════════════════════════════════════════
+        if final_text:
+            return final_text, error_type
         else:
-            await cp.scroll_to_bottom()
-            await asyncio.sleep(1)
-            st = await cp.read_state()
-            dt = st.get("domText", "")
-            if dt and not _is_censored(dt):
-                yield ("final", dt, None)
+            # 兜底
+            clip = await cp.click_copy_and_wait(timeout=5.0)
+            if clip and not _is_censored(clip):
+                print(f"  [#{req_id}] 📋 兜底复制: {len(clip)} 字")
+                return clip, error_type
+            elif best_dom_text:
+                print(f"  [#{req_id}] 📋 兜底快照: "
+                      f"{len(best_dom_text)} 字")
+                return best_dom_text, error_type
             else:
-                yield ("error", "抱歉，未能获取到响应。请稍后重试。", "no_response")
+                await cp.scroll_to_bottom()
+                await asyncio.sleep(1)
+                st = await cp.read_state()
+                dt = st.get("domText", "")
+                if dt and not _is_censored(dt):
+                    print(f"  [#{req_id}] 📋 兜底DOM: {len(dt)} 字")
+                    return dt, error_type
+                else:
+                    print(f"  [#{req_id}] ❌ 完全无响应")
+                    if error_type:
+                        return None, error_type
+                    return "抱歉，未能获取到响应。请稍后重试。", "no_response"
 
     # ═══════════════════════════════════════════════════════════════
     # 登录状态检测 & 自动重登录
@@ -1259,7 +1280,6 @@ class BrowserManager:
                 print(f"  ⚠️ 刷新页面#{cp.page_id} 失败: {e}")
         return refreshed
 
-
     async def is_alive(self) -> bool:
         if not self._ready or not self._pages:
             return False
@@ -1282,7 +1302,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "clipboard-first-v5-error-detect-stream-chunk",
+            "mode": "clipboard-first-v6-stable-heartbeat",
             "has_token": True,
             "cookie_count": 0,
             "page_count": len(self._pages),
@@ -1387,4 +1407,3 @@ class BrowserManager:
             print("🔒 已关闭")
         except Exception as e:
             print(f"⚠️ {e}")
-
