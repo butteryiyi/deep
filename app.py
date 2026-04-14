@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
 import uvicorn
 
-from browser_manager import BrowserManager
+from browser_manager import BrowserManager, HEARTBEAT_MARKER
 from keepalive import KeepaliveService
 
 # ============================================================
@@ -70,7 +70,7 @@ async def ensure_browser_ready():
     if not await browser_mgr.is_alive():
         raise HTTPException(status_code=503, detail="浏览器会话已断开")
 
-    # ═══ 新增：请求到达时检查登录状态 ═══
+    # ═══ 请求到达时检查登录状态 ═══
     if not browser_mgr.logged_in:
         print("  ⚠️ 请求到达但未登录，尝试重新登录...")
         success = await browser_mgr.re_login()
@@ -80,13 +80,11 @@ async def ensure_browser_ready():
                 detail="登录状态失效且重新登录失败，请更新 Cookie"
             )
 
-    # 轻量检查（不是每次都做深度检查，只在 logged_in 标记为 True 时做抽查）
     # 每 20 个请求做一次深度检查
     if browser_mgr.total_requests % 20 == 0:
         is_ok = await browser_mgr.check_login_status()
         if not is_ok:
             print("  ⚠️ 抽查发现登录失效，尝试重新登录...")
-    
 
 
 @asynccontextmanager
@@ -249,7 +247,6 @@ async def list_models(request: Request):
 
 def build_prompt_from_messages(messages: list) -> str:
     """将 OpenAI 格式的 messages 数组拼接为单个 prompt 字符串。"""
-    # 如果只有一条用户消息，直接返回内容
     user_messages = [m for m in messages if m.get("role") == "user"]
     if len(messages) == 1 and messages[0].get("role") == "user":
         content = messages[0].get("content", "")
@@ -261,7 +258,6 @@ def build_prompt_from_messages(messages: list) -> str:
                 if isinstance(part, dict) and part.get("type") == "text"
             )
 
-    # 多轮对话，拼接上下文
     prompt_parts = []
     for message in messages:
         role = message.get("role", "")
@@ -306,14 +302,23 @@ async def chat_completions(request: Request):
 
     print(f"📝 构建的 prompt 长度: {len(user_prompt)} 字符")
 
+    model = body.get("model", "deepseek-chat")
+    req_id = f"chatcmpl-{int(time.time()*1000)}"
+
     if stream:
         async def generate():
             async for chunk in browser_mgr.send_message_stream(user_prompt):
+                # ★ 心跳标记：发 SSE 注释保活，客户端会忽略
+                if chunk == HEARTBEAT_MARKER:
+                    yield ": heartbeat\n\n"
+                    continue
+
+                # 正常内容
                 data = {
-                    "id": f"chatcmpl-{int(time.time()*1000)}",
+                    "id": req_id,
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
-                    "model": body.get("model", "deepseek-chat"),
+                    "model": model,
                     "choices": [{
                         "index": 0,
                         "delta": {"content": chunk},
@@ -322,11 +327,12 @@ async def chat_completions(request: Request):
                 }
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+            # 结束标记
             end_data = {
-                "id": f"chatcmpl-{int(time.time()*1000)}",
+                "id": req_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": body.get("model", "deepseek-chat"),
+                "model": model,
                 "choices": [{
                     "index": 0,
                     "delta": {},
@@ -334,16 +340,16 @@ async def chat_completions(request: Request):
                 }]
             }
             yield f"data: {json.dumps(end_data, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            yield "data:\n\n"
 
         return StreamingResponse(generate(), media_type="text/event-stream")
     else:
         response_text = await browser_mgr.send_message(user_prompt)
         return {
-            "id": f"chatcmpl-{int(time.time()*1000)}",
+            "id": req_id,
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": body.get("model", "deepseek-chat"),
+            "model": model,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": response_text},
@@ -413,6 +419,11 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_json({"type": "start"})
             full_response = ""
             async for chunk in browser_mgr.send_message_stream(message):
+                # ★ 心跳标记：WebSocket 发 ping 类型消息，不当内容处理
+                if chunk == HEARTBEAT_MARKER:
+                    await websocket.send_json({"type": "heartbeat"})
+                    continue
+
                 full_response += chunk
                 await websocket.send_json({"type": "chunk", "content": chunk})
             await websocket.send_json({"type": "end", "full_content": full_response})
