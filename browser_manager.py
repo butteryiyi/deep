@@ -312,7 +312,18 @@ class ChatPage:
 
     async def read_state(self) -> dict:
         try:
-            return await self.page.evaluate(READ_STATE_JS)
+            return await asyncio.wait_for(
+                self.page.evaluate(READ_STATE_JS),
+                timeout=15
+            )
+        except asyncio.TimeoutError:
+            return {
+                "domText": "", "domLen": 0, "thinkLen": 0,
+                "hasButton": False, "buttonCount": 0,
+                "isComplete": False, "isGenerating": False,
+                "itemCount": 0, "errorText": "", "hasError": False,
+                "error": "evaluate_timeout",
+            }
         except Exception as e:
             return {
                 "domText": "", "domLen": 0, "thinkLen": 0,
@@ -324,16 +335,25 @@ class ChatPage:
 
     async def click_copy_and_wait(self, timeout: float = 3.0) -> str:
         try:
-            result = await self.page.evaluate(CLICK_COPY_JS)
+            result = await asyncio.wait_for(
+                self.page.evaluate(CLICK_COPY_JS),
+                timeout=10
+            )
             if result in ('not-found', 'no-items'):
                 return ""
 
             deadline = time.time() + timeout
             while time.time() < deadline:
                 await asyncio.sleep(0.15)
-                clip = await self.page.evaluate(
-                    "() => (window.__clipData && window.__clipData.text) || ''"
-                )
+                try:
+                    clip = await asyncio.wait_for(
+                        self.page.evaluate(
+                            "() => (window.__clipData && window.__clipData.text) || ''"
+                        ),
+                        timeout=5
+                    )
+                except asyncio.TimeoutError:
+                    continue
                 if clip:
                     return clip
             return ""
@@ -343,30 +363,38 @@ class ChatPage:
 
     async def scroll_to_bottom(self):
         try:
-            await self.page.evaluate(SCROLL_BOTTOM_JS)
+            await asyncio.wait_for(
+                self.page.evaluate(SCROLL_BOTTOM_JS),
+                timeout=5
+            )
         except Exception:
             pass
 
     async def click_regenerate(self) -> str:
-        """点击重新生成按钮"""
         try:
-            result = await self.page.evaluate(CLICK_REGENERATE_JS)
+            result = await asyncio.wait_for(
+                self.page.evaluate(CLICK_REGENERATE_JS),
+                timeout=10
+            )
             return result
+        except asyncio.TimeoutError:
+            return "timeout"
         except Exception as e:
             print(f"  ⚠️ 点击重新生成失败: {e}")
             return f"error:{e}"
 
+
     async def check_server_error(self) -> tuple[bool, str]:
-        """检查页面是否存在服务器错误提示"""
+        """检查页面是否存在服务器错误提示（加超时保护）"""
         try:
-            state = await self.read_state()
+            state = await self.read_state()  # 已有超时保护
             error_text = state.get("errorText", "")
             has_error = state.get("hasError", False)
 
             if has_error:
                 return True, error_text.strip()
 
-            html_check = await self.page.evaluate("""
+            html_check = await asyncio.wait_for(self.page.evaluate("""
                 () => {
                     const items = document.querySelectorAll('div[data-virtual-list-item-key]');
                     if (items.length === 0) return { found: false, text: '' };
@@ -392,12 +420,14 @@ class ChatPage:
 
                     return { found: false, text: '' };
                 }
-            """)
+            """), timeout=10)
 
             if html_check and html_check.get("found"):
                 return True, html_check.get("text", "unknown error")
 
             return False, ""
+        except asyncio.TimeoutError:
+            return False, "check_timeout"
         except Exception as e:
             return False, f"check_error_failed:{e}"
 
@@ -469,7 +499,7 @@ class ChatPage:
 # ═══════════════════════════════════════════════════════════════
 # SSE 心跳标记 — 用于保活，不携带任何内容
 # ═══════════════════════════════════════════════════════════════
-HEARTBEAT_MARKER = ""
+HEARTBEAT_MARKER = "\x00__HEARTBEAT__\x00"
 
 
 class BrowserManager:
@@ -709,6 +739,12 @@ class BrowserManager:
     # 流式接口 — 回归旧版：生成中只发心跳保活，完成后一次性输出结果
     # ═══════════════════════════════════════════════════════════════
     async def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
+        """
+        假流式输出：
+        - 后台线程完成全部工作（获取页面 → 发送 → 等待 → 重试 → 释放页面）
+        - 前台从第一秒起就持续发心跳，保证连接不被反向代理切断
+        - 后台完成后，一次性 yield 完整结果
+        """
         if not self._ready:
             ok = await self.wait_until_ready(timeout=180)
             if not ok:
@@ -720,100 +756,95 @@ class BrowserManager:
         req_id = self.total_requests
         print(f"📨 #{req_id} ({len(message)} 字符)")
 
-        cp = None
-        try:
-            cp = await asyncio.wait_for(self._acquire_page(), timeout=300)
-        except (asyncio.TimeoutError, RuntimeError) as e:
-            yield f"[错误] {e}"
-            return
+        # ── 共享状态 ──
+        done_event = asyncio.Event()
+        holder = {"text": None, "error_type": None}
 
-        print(f"  [#{req_id}] → 页面#{cp.page_id}")
-
-        # ═══════════════════════════════════════════════════
-        # 支持重试的外层循环
-        # ═══════════════════════════════════════════════════
-        max_retries = 2
-        retry_count = 0
-
-        try:
-            while retry_count <= max_retries:
-                result = None
-                error_type = None
-
+        async def _background_work():
+            """后台：获取页面 → 发送消息 → 等待结果 → 重试 → 释放页面"""
+            cp = None
+            try:
+                # 1) 获取空闲页面（缩短到 120s，因为心跳已经在跑了）
                 try:
-                    # 用一个 asyncio.Task 跑核心等待逻辑
-                    # 同时在这里定期 yield 心跳保活
-                    result_future = asyncio.get_event_loop().create_future()
+                    cp = await asyncio.wait_for(self._acquire_page(), timeout=120)
+                except asyncio.TimeoutError:
+                    holder["text"] = "[错误] 所有页面繁忙，等待超时，请稍后重试"
+                    holder["error_type"] = "page_timeout"
+                    return
+                except RuntimeError as e:
+                    holder["text"] = f"[错误] {e}"
+                    holder["error_type"] = "exception"
+                    return
 
-                    async def _run_core():
-                        try:
-                            r, e = await self._do_send_and_wait(
-                                cp, message, req_id, retry_count
-                            )
-                            result_future.set_result((r, e))
-                        except Exception as exc:
-                            result_future.set_exception(exc)
+                print(f"  [#{req_id}] → 页面#{cp.page_id}")
 
-                    task = asyncio.create_task(_run_core())
+                # 2) 重试循环
+                max_retries = 2
+                for attempt in range(max_retries + 1):
+                    text, err = await self._do_send_and_wait(
+                        cp, message, req_id, attempt
+                    )
 
-                    # 每 8 秒发一次心跳，直到核心逻辑完成
-                    while not result_future.done():
-                        try:
-                            await asyncio.wait_for(
-                                asyncio.shield(result_future), timeout=8.0
-                            )
-                        except asyncio.TimeoutError:
-                            # 核心逻辑还没完成，发心跳保活
-                            yield HEARTBEAT_MARKER
-                            continue
-                        except Exception:
-                            break
+                    if err == "server_error" and attempt < max_retries:
+                        wait_time = 5 * (attempt + 1)
+                        print(f"  [#{req_id}] 🔄 服务器错误，{wait_time}s 后重试 "
+                              f"({attempt + 1}/{max_retries})...")
+                        await asyncio.sleep(wait_time)
+                        await self._recover_page(cp)
+                        continue
 
-                    # 拿结果
-                    if result_future.done():
-                        if result_future.exception():
-                            raise result_future.exception()
-                        result, error_type = result_future.result()
-                    else:
-                        await task
-                        result, error_type = result_future.result()
-
-                except Exception as e:
-                    print(f"  [#{req_id}] ❌ 执行异常: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    result = f"[错误] {str(e)}"
-                    error_type = "exception"
-
-                if error_type == "server_error" and retry_count < max_retries:
-                    retry_count += 1
-                    wait_time = 5 * retry_count
-                    print(f"  [#{req_id}] 🔄 服务器错误，{wait_time}s 后重试 "
-                          f"({retry_count}/{max_retries})...")
-                    await asyncio.sleep(wait_time)
-                    await self._recover_page(cp)
-                    continue
-
-                elif error_type == "server_error":
-                    self._consecutive_errors += 1
-                    self._last_error_time = time.time()
-                    if result:
-                        yield result
-                    else:
-                        yield "[错误] 服务器繁忙，多次重试后仍然失败，请稍后重试。"
-                    break
-
-                else:
-                    if error_type is None:
+                    # 最终结果（成功或最后一次失败）
+                    holder["text"] = text
+                    holder["error_type"] = err
+                    if err is None:
                         self._consecutive_errors = 0
-                    if result:
-                        yield result
+                    elif err == "server_error":
+                        self._consecutive_errors += 1
+                        self._last_error_time = time.time()
                     break
 
-        finally:
-            if cp:
-                self._release_page(cp)
+                # 如果重试完还没设置 text
+                if holder["text"] is None and holder["error_type"] == "server_error":
+                    holder["text"] = "[错误] 服务器繁忙，多次重试后仍然失败，请稍后重试。"
 
+            except Exception as e:
+                print(f"  [#{req_id}] ❌ 后台任务异常: {e}")
+                import traceback
+                traceback.print_exc()
+                holder["text"] = f"[错误] {e}"
+                holder["error_type"] = "exception"
+            finally:
+                if cp:
+                    self._release_page(cp)
+                done_event.set()  # ★ 无论如何都要 set，否则前台死循环
+
+        # ── 启动后台任务 ──
+        task = asyncio.create_task(_background_work())
+
+        # ── 前台：心跳保活（从此刻起立即开始） ──
+        heartbeat_interval = 3.0   # 每 3 秒一次，足够应对大多数代理超时
+        while not done_event.is_set():
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=heartbeat_interval)
+                # done_event 被 set 了，跳出循环
+                break
+            except asyncio.TimeoutError:
+                # 还没完成，发一次心跳
+                yield HEARTBEAT_MARKER
+
+        # ── 确保后台任务真正完成 ──
+        if not task.done():
+            try:
+                await task
+            except Exception:
+                pass  # 异常已在 _background_work 内部处理
+
+        # ── 输出最终结果 ──
+        final_text = holder.get("text")
+        if final_text:
+            yield final_text
+        else:
+            yield "抱歉，未能获取到响应。请稍后重试。"
     # ═══════════════════════════════════════════════════════════════
     # 核心等待逻辑 — 与旧版完全一致：只监控+保存快照，不输出任何内容
     # ═══════════════════════════════════════════════════════════════
