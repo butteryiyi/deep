@@ -3,6 +3,7 @@
 # DOM 纯文本仅用于：审查检测、长度监控、兜底
 # v6: 回归旧版稳定发送模式（非流式积攒） + SSE心跳保活解决超时
 #     保留：服务器错误检测 + 自动重试 + 页面恢复 + 登录检测/重登录
+#     新增：每次发送消息前自动点击"专家模式"按钮
 
 import os
 import sys
@@ -279,6 +280,112 @@ CLICK_REGENERATE_JS = """
 }
 """
 
+# ═══════════════════════════════════════════════════════════════
+# 点击专家模式按钮
+# ═══════════════════════════════════════════════════════════════
+CLICK_EXPERT_MODE_JS = """
+() => {
+    // 策略1: 通过 data-model-type="expert" 属性精确定位
+    const expertByAttr = document.querySelector('[data-model-type="expert"]');
+    if (expertByAttr) {
+        // 检查是否已经选中 (aria-checked="true")
+        const isChecked = expertByAttr.getAttribute('aria-checked');
+        if (isChecked === 'true') {
+            return { status: 'already_selected', method: 'data-attr' };
+        }
+        expertByAttr.click();
+        return { status: 'clicked', method: 'data-attr' };
+    }
+
+    // 策略2: 通过文本内容"专家模式"查找
+    const allDivs = document.querySelectorAll('div[role="radio"]');
+    for (const div of allDivs) {
+        const text = (div.innerText || '').trim();
+        if (text.includes('专家模式')) {
+            const isChecked = div.getAttribute('aria-checked');
+            if (isChecked === 'true') {
+                return { status: 'already_selected', method: 'role-radio-text' };
+            }
+            div.click();
+            return { status: 'clicked', method: 'role-radio-text' };
+        }
+    }
+
+    // 策略3: 通过类名 _9f2341b 查找 (从 expert_mode_info.json 得知)
+    const byClass = document.querySelectorAll('div._9f2341b');
+    for (const el of byClass) {
+        const text = (el.innerText || '').trim();
+        if (text.includes('专家模式') || text.includes('Expert')) {
+            const isChecked = el.getAttribute('aria-checked');
+            if (isChecked === 'true') {
+                return { status: 'already_selected', method: 'class-name' };
+            }
+            el.click();
+            return { status: 'clicked', method: 'class-name' };
+        }
+    }
+
+    // 策略4: 遍历所有包含"专家模式"文本的可点击元素
+    const allClickables = document.querySelectorAll('div, span, button, a');
+    for (const el of allClickables) {
+        const directText = el.childNodes.length > 0 ?
+            Array.from(el.childNodes)
+                .filter(n => n.nodeType === 3)
+                .map(n => n.textContent.trim())
+                .join('') : '';
+        const innerText = (el.innerText || '').trim();
+
+        if (innerText === '专家模式' || directText === '专家模式') {
+            // 找到包含此文本的最近的可点击父元素
+            let target = el;
+            let parent = el.parentElement;
+            while (parent) {
+                if (parent.getAttribute('role') === 'radio' ||
+                    parent.getAttribute('data-model-type') === 'expert' ||
+                    parent.classList.contains('_9f2341b')) {
+                    target = parent;
+                    break;
+                }
+                parent = parent.parentElement;
+            }
+            target.click();
+            return { status: 'clicked', method: 'text-search' };
+        }
+    }
+
+    return { status: 'not_found', method: 'none' };
+}
+"""
+
+# ═══════════════════════════════════════════════════════════════
+# 检查专家模式是否已选中
+# ═══════════════════════════════════════════════════════════════
+CHECK_EXPERT_MODE_JS = """
+() => {
+    // 检查 data-model-type="expert" 的元素是否 aria-checked="true"
+    const expertEl = document.querySelector('[data-model-type="expert"]');
+    if (expertEl) {
+        return {
+            found: true,
+            checked: expertEl.getAttribute('aria-checked') === 'true'
+        };
+    }
+
+    // 备用: 通过文本查找
+    const radios = document.querySelectorAll('div[role="radio"]');
+    for (const radio of radios) {
+        if ((radio.innerText || '').includes('专家模式')) {
+            return {
+                found: true,
+                checked: radio.getAttribute('aria-checked') === 'true'
+            };
+        }
+    }
+
+    return { found: false, checked: false };
+}
+"""
+
 
 class ChatPage:
     def __init__(self, page, page_id: int):
@@ -383,6 +490,69 @@ class ChatPage:
             print(f"  ⚠️ 点击重新生成失败: {e}")
             return f"error:{e}"
 
+    async def click_expert_mode(self) -> dict:
+        """点击专家模式按钮，返回操作结果"""
+        try:
+            result = await asyncio.wait_for(
+                self.page.evaluate(CLICK_EXPERT_MODE_JS),
+                timeout=10
+            )
+            return result
+        except asyncio.TimeoutError:
+            return {"status": "timeout", "method": "none"}
+        except Exception as e:
+            print(f"  ⚠️ P#{self.page_id} 点击专家模式失败: {e}")
+            return {"status": f"error:{e}", "method": "none"}
+
+    async def check_expert_mode(self) -> dict:
+        """检查专家模式是否已选中"""
+        try:
+            result = await asyncio.wait_for(
+                self.page.evaluate(CHECK_EXPERT_MODE_JS),
+                timeout=5
+            )
+            return result
+        except asyncio.TimeoutError:
+            return {"found": False, "checked": False}
+        except Exception as e:
+            return {"found": False, "checked": False}
+
+    async def ensure_expert_mode(self) -> bool:
+        """
+        确保专家模式已选中。
+        返回 True 表示专家模式已激活（包括已经是选中状态），
+        返回 False 表示无法激活专家模式。
+        """
+        # 先检查当前状态
+        check = await self.check_expert_mode()
+        if check.get("checked"):
+            return True
+
+        # 如果未选中，点击激活
+        result = await self.click_expert_mode()
+        status = result.get("status", "")
+        method = result.get("method", "")
+
+        if status == "already_selected":
+            return True
+        elif status == "clicked":
+            # 等待一小段时间让 UI 更新
+            await asyncio.sleep(0.5)
+            # 验证是否成功切换
+            verify = await self.check_expert_mode()
+            if verify.get("checked"):
+                print(f"  🔷 P#{self.page_id} 专家模式已激活 (方式: {method})")
+                return True
+            else:
+                # 有时候点击后 aria-checked 不会立即更新，但实际已生效
+                print(f"  🔷 P#{self.page_id} 专家模式已点击 (方式: {method})，验证状态未确认，继续执行")
+                return True
+        elif status == "not_found":
+            print(f"  ⚠️ P#{self.page_id} 未找到专家模式按钮")
+            return False
+        else:
+            print(f"  ⚠️ P#{self.page_id} 专家模式操作异常: {status}")
+            return False
 
     async def check_server_error(self) -> tuple[bool, str]:
         """检查页面是否存在服务器错误提示（加超时保护）"""
@@ -845,8 +1015,9 @@ class BrowserManager:
             yield final_text
         else:
             yield "抱歉，未能获取到响应。请稍后重试。"
+
     # ═══════════════════════════════════════════════════════════════
-    # 核心等待逻辑 — 与旧版完全一致：只监控+保存快照，不输出任何内容
+    # 核心等待逻辑 — 新增：发送消息前自动点击专家模式
     # ═══════════════════════════════════════════════════════════════
     async def _do_send_and_wait(
         self, cp: ChatPage, message: str, req_id: int, retry_num: int
@@ -870,6 +1041,14 @@ class BrowserManager:
         await asyncio.sleep(0.5)
         await cp.ensure_clipboard_hook()
         await cp.reset_clip()
+
+        # ═══ 新增：点击专家模式 ═══
+        expert_ok = await cp.ensure_expert_mode()
+        if expert_ok:
+            print(f"  [#{req_id}] 🔷 专家模式已确认激活")
+        else:
+            print(f"  [#{req_id}] ⚠️ 专家模式未能激活，将以当前模式继续")
+        await asyncio.sleep(0.3)
 
         # 发送消息
         await cp.type_and_send(message)
@@ -1333,7 +1512,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "clipboard-first-v6-stable-heartbeat",
+            "mode": "clipboard-first-v6-expert-mode",
             "has_token": True,
             "cookie_count": 0,
             "page_count": len(self._pages),
