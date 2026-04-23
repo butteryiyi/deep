@@ -247,38 +247,7 @@ async def list_models(request: Request):
 
 
 def build_prompt_from_messages(messages: list) -> str:
-    """将 OpenAI 格式的 messages 数组拼接为单个 prompt 字符串。"""
-    user_messages = [m for m in messages if m.get("role") == "user"]
-    if len(messages) == 1 and messages[0].get("role") == "user":
-        content = messages[0].get("content", "")
-        if isinstance(content, str):
-            return content
-        elif isinstance(content, list):
-            return "".join(
-                part.get("text", "") for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
-
-    prompt_parts = []
-    for message in messages:
-        role = message.get("role", "")
-        content = message.get("content", "")
-
-        if isinstance(content, list):
-            content = "".join(
-                part.get("text", "") for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
-
-        if role == "system":
-            prompt_parts.append(f"[系统指令] {content}")
-        elif role == "user":
-            prompt_parts.append(f"[用户] {content}")
-        elif role == "assistant":
-            prompt_parts.append(f"[助手] {content}")
-
-    prompt_parts.append("\n请基于以上对话历史，回复最后一条用户消息。")
-    return "\n\n".join(prompt_parts)
+    return json.dumps({"messages": messages}, ensure_ascii=False)
 
 
 @app.post("/v1/chat/completions")
