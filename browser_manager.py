@@ -1,7 +1,7 @@
 # browser_manager.py
 # 策略：生成中只监控+保存快照，完成后点复制按钮拿原生 Markdown
 # DOM 纯文本仅用于：审查检测、长度监控、兜底
-# v6.1: 基于旧版v6 — 唯一改动：所有消息都通过文件上传发送，不再粘贴到textarea
+# v6.2: 基于v6.1 — 修复：upload_file_and_send 多重发送策略 + is_alive 保留
 #       保留：服务器错误检测 + 自动重试 + 页面恢复 + 登录检测/重登录
 #       保留：每次发送消息前自动点击"专家模式"按钮
 
@@ -580,7 +580,7 @@ class ChatPage:
             print(f"  ⚠️ P#{self.page_id} 专家模式操作异常: {status}")
             return False
 
-    async def check_server_error(self) -> tuple[bool, str]:
+    async def check_server_error(self) -> tuple:
         """检查页面是否存在服务器错误提示"""
         try:
             state = await self.read_state()
@@ -676,301 +676,245 @@ class ChatPage:
         await asyncio.sleep(3)
 
     # ═══════════════════════════════════════════════════════════════
-    # ★ 新增：通过 input[type=file] 上传文件（最可靠的方式）
+    # ★ 检查消息是否已发送（itemCount 增加了）
     # ═══════════════════════════════════════════════════════════════
-async def upload_file_and_send(self, file_path: str, trigger_text: str) -> bool:
-    """
-    上传文件 + 输入触发语 + 按回车发送。
-    返回 True 表示成功发送，False 表示上传失败。
-    """
-    # ── 第1步：通过 input[type=file] 设置文件 ──
-    uploaded = False
-    try:
-        file_input = self.page.locator('input[type="file"]')
-        count = await file_input.count()
-        if count > 0:
-            for i in range(count):
-                try:
-                    await file_input.nth(i).set_input_files(file_path)
-                    uploaded = True
-                    break
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"  ⚠️ P#{self.page_id} set_input_files 失败: {e}")
-
-    if not uploaded:
+    async def _check_message_sent(self) -> bool:
+        """检查消息是否已经发送成功（对话列表出现了新条目）"""
         try:
-            async with self.page.expect_file_chooser(timeout=5000) as fc_info:
+            state = await self.read_state()
+            return state.get("itemCount", 0) >= 1
+        except Exception:
+            return False
+
+    # ═══════════════════════════════════════════════════════════════
+    # ★ 通过 input[type=file] 上传文件（修复版：多重发送策略）
+    # ═══════════════════════════════════════════════════════════════
+    async def upload_file_and_send(self, file_path: str, trigger_text: str) -> bool:
+        """
+        上传文件 + 输入触发语 + 发送。
+        返回 True 表示成功发送，False 表示上传失败。
+        """
+        # ── 第1步：通过 input[type=file] 设置文件 ──
+        uploaded = False
+        try:
+            file_input = self.page.locator('input[type="file"]')
+            count = await file_input.count()
+            if count > 0:
+                for i in range(count):
+                    try:
+                        await file_input.nth(i).set_input_files(file_path)
+                        uploaded = True
+                        break
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"  ⚠️ P#{self.page_id} set_input_files 失败: {e}")
+
+        if not uploaded:
+            # 兜底：通过 expect_file_chooser
+            try:
+                async with self.page.expect_file_chooser(timeout=5000) as fc_info:
+                    await self.page.evaluate("""
+                        () => {
+                            const textarea = document.querySelector('textarea');
+                            if (!textarea) return;
+                            let container = textarea;
+                            for (let i = 0; i < 8; i++) {
+                                if (container.parentElement) container = container.parentElement;
+                            }
+                            const btns = container.querySelectorAll('div.ds-icon-button');
+                            for (const btn of btns) {
+                                const svg = btn.querySelector('svg');
+                                if (svg) {
+                                    btn.click();
+                                    return;
+                                }
+                            }
+                        }
+                    """)
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(file_path)
+                uploaded = True
+            except Exception as e:
+                print(f"  ⚠️ P#{self.page_id} file_chooser 方式也失败: {e}")
+
+        if not uploaded:
+            return False
+
+        # ── 第2步：等待文件附件出现在输入区域 ──
+        attach_ok = False
+        for _ in range(20):  # 最多等 10 秒
+            await asyncio.sleep(0.5)
+            try:
+                check = await asyncio.wait_for(
+                    self.page.evaluate(CHECK_FILE_ATTACHED_JS),
+                    timeout=5
+                )
+                if check.get("attached"):
+                    attach_ok = True
+                    print(f"  ✅ P#{self.page_id} 文件附件已出现 (方式: {check.get('method')})")
+                    break
+            except Exception:
+                continue
+
+        if not attach_ok:
+            print(f"  ⚠️ P#{self.page_id} 文件上传后未检测到附件预览，仍尝试发送")
+
+        # ── 第3步：等待附件渲染稳定 ──
+        await asyncio.sleep(0.8)
+
+        # ── 第4步：在 textarea 输入触发语 ──
+        textarea = self.page.locator("textarea").first
+        try:
+            await textarea.wait_for(state="visible", timeout=5000)
+        except Exception as e:
+            print(f"  ⚠️ P#{self.page_id} textarea 不可见: {e}")
+
+        # ★ 强制点击 textarea 获取焦点
+        try:
+            await textarea.click()
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+        # ★ 用 keyboard.type() 模拟真实键盘输入（比 fill 更可靠触发 React 事件）
+        input_success = False
+        try:
+            await textarea.fill("")
+            await asyncio.sleep(0.1)
+            await self.page.keyboard.type(trigger_text, delay=10)
+            await asyncio.sleep(0.3)
+            input_success = True
+        except Exception as e1:
+            print(f"  ⚠️ P#{self.page_id} keyboard.type 失败: {e1}, 尝试 fill")
+            try:
+                await textarea.fill(trigger_text)
+                await asyncio.sleep(0.3)
+                input_success = True
+            except Exception as e2:
+                print(f"  ⚠️ P#{self.page_id} fill 也失败: {e2}, 尝试 JS")
+
+        # 兜底：JS 强制设值
+        if not input_success:
+            try:
+                await self.page.evaluate("""
+                    (text) => {
+                        const el = document.querySelector('textarea');
+                        if (!el) return;
+                        el.focus();
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, 'value'
+                        ).set;
+                        nativeInputValueSetter.call(el, text);
+                        el.dispatchEvent(new Event('focus', { bubbles: true }));
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                """, trigger_text)
+                await asyncio.sleep(0.3)
+            except Exception as e3:
+                print(f"  ⚠️ P#{self.page_id} JS 输入也失败: {e3}")
+
+        # ── 第5步：多重发送策略 ──
+        sent = False
+
+        # 策略1：点击 textarea 确保焦点 → textarea.press("Enter")
+        try:
+            await textarea.click()
+            await asyncio.sleep(0.2)
+            await textarea.press("Enter")
+            await asyncio.sleep(1.0)
+            if await self._check_message_sent():
+                sent = True
+                print(f"  ✅ P#{self.page_id} 发送成功 (策略1: textarea.press Enter)")
+        except Exception as e:
+            print(f"  ⚠️ P#{self.page_id} 策略1失败: {e}")
+
+        # 策略2：page.keyboard.press("Enter")
+        if not sent:
+            try:
+                await textarea.click()
+                await asyncio.sleep(0.2)
+                await self.page.keyboard.press("Enter")
+                await asyncio.sleep(1.0)
+                if await self._check_message_sent():
+                    sent = True
+                    print(f"  ✅ P#{self.page_id} 发送成功 (策略2: keyboard.press Enter)")
+            except Exception as e:
+                print(f"  ⚠️ P#{self.page_id} 策略2失败: {e}")
+
+        # 策略3：点击发送按钮（页面上的蓝色圆形按钮）
+        if not sent:
+            try:
+                clicked = await self.page.evaluate("""
+                    () => {
+                        const textarea = document.querySelector('textarea');
+                        if (!textarea) return 'no-textarea';
+
+                        let container = textarea;
+                        for (let i = 0; i < 6; i++) {
+                            if (container.parentElement) container = container.parentElement;
+                        }
+
+                        // 找所有 ds-icon-button，发送按钮通常是最后一个
+                        const allBtns = container.querySelectorAll('div.ds-icon-button');
+                        if (allBtns.length > 0) {
+                            const lastBtn = allBtns[allBtns.length - 1];
+                            lastBtn.click();
+                            return 'clicked-last-btn';
+                        }
+
+                        return 'not-found';
+                    }
+                """)
+                if clicked and 'clicked' in clicked:
+                    await asyncio.sleep(1.0)
+                    if await self._check_message_sent():
+                        sent = True
+                        print(f"  ✅ P#{self.page_id} 发送成功 (策略3: 点击发送按钮 {clicked})")
+            except Exception as e:
+                print(f"  ⚠️ P#{self.page_id} 策略3失败: {e}")
+
+        # 策略4：JS 模拟 Enter 键事件
+        if not sent:
+            try:
                 await self.page.evaluate("""
                     () => {
                         const textarea = document.querySelector('textarea');
                         if (!textarea) return;
-                        let container = textarea;
-                        for (let i = 0; i < 8; i++) {
-                            if (container.parentElement) container = container.parentElement;
-                        }
-                        const btns = container.querySelectorAll('div.ds-icon-button');
-                        for (const btn of btns) {
-                            const svg = btn.querySelector('svg');
-                            if (svg) {
-                                btn.click();
-                                return;
-                            }
-                        }
+                        textarea.focus();
+
+                        // 模拟完整的按键事件序列
+                        const keydownEvent = new KeyboardEvent('keydown', {
+                            key: 'Enter', code: 'Enter', keyCode: 13,
+                            which: 13, bubbles: true, cancelable: true
+                        });
+                        const keypressEvent = new KeyboardEvent('keypress', {
+                            key: 'Enter', code: 'Enter', keyCode: 13,
+                            which: 13, bubbles: true, cancelable: true
+                        });
+                        const keyupEvent = new KeyboardEvent('keyup', {
+                            key: 'Enter', code: 'Enter', keyCode: 13,
+                            which: 13, bubbles: true, cancelable: true
+                        });
+
+                        textarea.dispatchEvent(keydownEvent);
+                        textarea.dispatchEvent(keypressEvent);
+                        textarea.dispatchEvent(keyupEvent);
                     }
                 """)
-            file_chooser = await fc_info.value
-            await file_chooser.set_files(file_path)
-            uploaded = True
-        except Exception as e:
-            print(f"  ⚠️ P#{self.page_id} file_chooser 方式也失败: {e}")
-
-    if not uploaded:
-        return False
-
-    # ── 第2步：等待文件附件出现在输入区域 ──
-    attach_ok = False
-    for _ in range(20):  # 最多等 10 秒
-        await asyncio.sleep(0.5)
-        try:
-            check = await asyncio.wait_for(
-                self.page.evaluate(CHECK_FILE_ATTACHED_JS),
-                timeout=5
-            )
-            if check.get("attached"):
-                attach_ok = True
-                break
-        except Exception:
-            continue
-
-    if not attach_ok:
-        print(f"  ⚠️ P#{self.page_id} 文件上传后未检测到附件预览，仍尝试发送")
-
-    # ══════════════════════════════════════════════════════════
-    # ★ 修复核心：确保 textarea 获得焦点 + 正确触发 React 状态
-    # ══════════════════════════════════════════════════════════
-
-    # 等待附件渲染稳定
-    await asyncio.sleep(0.8)
-
-    textarea = self.page.locator("textarea").first
-    try:
-        await textarea.wait_for(state="visible", timeout=5000)
-    except Exception as e:
-        print(f"  ⚠️ P#{self.page_id} textarea 不可见: {e}")
-
-    # ★ 修复1：强制点击 textarea 获取焦点
-    try:
-        await textarea.click()
-        await asyncio.sleep(0.3)
-    except Exception:
-        pass
-
-    # ★ 修复2：用 Playwright 的 type() 逐字输入（而非 fill），
-    #           这样能正确触发 React 的 onChange/onInput 事件链
-    try:
-        # 先清空
-        await textarea.fill("")
-        await asyncio.sleep(0.1)
-
-        # 使用 page.keyboard.type() 模拟真实键盘输入
-        # 这比 fill() 更可靠地触发 React 事件
-        await self.page.keyboard.type(trigger_text, delay=10)
-        await asyncio.sleep(0.3)
-    except Exception:
-        # 兜底：JS 强制设值 + 手动派发完整事件链
-        try:
-            await self.page.evaluate("""
-                (text) => {
-                    const el = document.querySelector('textarea');
-                    if (!el) return;
-
-                    // 聚焦
-                    el.focus();
-
-                    // 通过原生 setter 设值
-                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        window.HTMLTextAreaElement.prototype, 'value'
-                    ).set;
-                    nativeInputValueSetter.call(el, text);
-
-                    // ★ 派发完整的事件链，确保 React 能捕获
-                    el.dispatchEvent(new Event('focus', { bubbles: true }));
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-
-                    // React 16+ 需要这个
-                    const reactPropsKey = Object.keys(el).find(
-                        k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$')
-                    );
-                    if (reactPropsKey && el[reactPropsKey] && el[reactPropsKey].onChange) {
-                        el[reactPropsKey].onChange({ target: el });
-                    }
-                }
-            """, trigger_text)
-            await asyncio.sleep(0.3)
-        except Exception as e2:
-            print(f"  ⚠️ P#{self.page_id} 输入触发语失败: {e2}")
-
-    # ★ 修复3：验证发送按钮是否可用，确认 React 状态已更新
-    send_ready = False
-    for _ in range(10):  # 最多等 5 秒
-        try:
-            is_ready = await self.page.evaluate("""
-                () => {
-                    const textarea = document.querySelector('textarea');
-                    if (!textarea) return false;
-
-                    // 检查 textarea 是否有内容
-                    if (!textarea.value || textarea.value.trim() === '') return false;
-
-                    // 检查发送按钮是否启用（蓝色可点击状态）
-                    // DeepSeek 的发送按钮在有内容时会变为可点击
-                    const sendBtns = document.querySelectorAll(
-                        '[class*="send"], [data-testid="send"], ' +
-                        'button[class*="submit"]'
-                    );
-
-                    // 也可以检查附近的 icon-button 是否有 disabled 属性
-                    return true;
-                }
-            """)
-            if is_ready:
-                send_ready = True
-                break
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
-
-    # ★ 修复4：再次确保焦点在 textarea，然后按 Enter
-    try:
-        await textarea.click()
-        await asyncio.sleep(0.2)
-    except Exception:
-        pass
-
-    # ══════════════════════════════════════════════════════════
-    # ★ 修复5：多重发送策略，确保消息发出去
-    # ══════════════════════════════════════════════════════════
-    sent = False
-
-    # 策略1：textarea.press("Enter")
-    try:
-        await textarea.press("Enter")
-        await asyncio.sleep(0.8)
-        # 验证是否发送成功（检查 itemCount 是否增加）
-        state = await self.read_state()
-        if state.get("itemCount", 0) >= 1:
-            sent = True
-            print(f"  ✅ P#{self.page_id} Enter 发送成功 (策略1: textarea.press)")
-    except Exception:
-        pass
-
-    # 策略2：page.keyboard.press("Enter")
-    if not sent:
-        try:
-            await textarea.click()
-            await asyncio.sleep(0.2)
-            await self.page.keyboard.press("Enter")
-            await asyncio.sleep(0.8)
-            state = await self.read_state()
-            if state.get("itemCount", 0) >= 1:
-                sent = True
-                print(f"  ✅ P#{self.page_id} Enter 发送成功 (策略2: keyboard.press)")
-        except Exception:
-            pass
-
-    # 策略3：点击发送按钮
-    if not sent:
-        try:
-            clicked = await self.page.evaluate("""
-                () => {
-                    // 找发送按钮（通常是输入框右侧的圆形按钮）
-                    const textarea = document.querySelector('textarea');
-                    if (!textarea) return 'no-textarea';
-
-                    let container = textarea;
-                    for (let i = 0; i < 6; i++) {
-                        if (container.parentElement) container = container.parentElement;
-                    }
-
-                    // 找所有可能的发送按钮
-                    const candidates = container.querySelectorAll(
-                        'div.ds-icon-button, button, [role="button"]'
-                    );
-
-                    for (const btn of candidates) {
-                        const svg = btn.querySelector('svg');
-                        if (!svg) continue;
-
-                        // 排除附件按钮（回形针图标），找发送按钮（箭头/三角图标）
-                        const paths = svg.querySelectorAll('path');
-                        for (const path of paths) {
-                            const d = (path.getAttribute('d') || '');
-                            // DeepSeek 发送按钮的 SVG path 通常包含向上箭头的特征
-                            if (d.includes('M12') || d.includes('arrow') ||
-                                btn.closest('[class*="send"]')) {
-                                btn.click();
-                                return 'clicked-send-btn';
-                            }
-                        }
-                    }
-
-                    // 兜底：找最后一个 icon-button（通常就是发送按钮）
-                    const allBtns = container.querySelectorAll('div.ds-icon-button');
-                    if (allBtns.length > 0) {
-                        const lastBtn = allBtns[allBtns.length - 1];
-                        lastBtn.click();
-                        return 'clicked-last-btn';
-                    }
-
-                    return 'not-found';
-                }
-            """)
-            if clicked and 'clicked' in clicked:
-                await asyncio.sleep(0.8)
-                state = await self.read_state()
-                if state.get("itemCount", 0) >= 1:
+                await asyncio.sleep(1.0)
+                if await self._check_message_sent():
                     sent = True
-                    print(f"  ✅ P#{self.page_id} 点击发送按钮成功 (策略3: {clicked})")
-        except Exception as e:
-            print(f"  ⚠️ P#{self.page_id} 点击发送按钮失败: {e}")
+                    print(f"  ✅ P#{self.page_id} 发送成功 (策略4: JS模拟Enter)")
+            except Exception as e:
+                print(f"  ⚠️ P#{self.page_id} 策略4失败: {e}")
 
-    # 策略4：JS 模拟 Enter 键事件
-    if not sent:
-        try:
-            await self.page.evaluate("""
-                () => {
-                    const textarea = document.querySelector('textarea');
-                    if (!textarea) return;
-                    textarea.focus();
-                    const enterEvent = new KeyboardEvent('keydown', {
-                        key: 'Enter',
-                        code: 'Enter',
-                        keyCode: 13,
-                        which: 13,
-                        bubbles: true,
-                        cancelable: true
-                    });
-                    textarea.dispatchEvent(enterEvent);
-                }
-            """)
-            await asyncio.sleep(0.8)
-            state = await self.read_state()
-            if state.get("itemCount", 0) >= 1:
-                sent = True
-                print(f"  ✅ P#{self.page_id} JS模拟Enter成功 (策略4)")
-        except Exception:
-            pass
+        if not sent:
+            print(f"  ⚠️ P#{self.page_id} 所有发送策略均未确认成功，继续等待...")
 
-    if not sent:
-        print(f"  ⚠️ P#{self.page_id} 所有发送策略均未确认成功，继续等待...")
-
-    await asyncio.sleep(0.5)
-    return True
-
-
+        await asyncio.sleep(0.5)
+        return True
 
     async def type_and_send(self, message: str):
         """原版：直接在 textarea 输入文字并发送"""
@@ -998,6 +942,9 @@ async def upload_file_and_send(self, file_path: str, trigger_text: str) -> bool:
         await textarea.press("Enter")
         await asyncio.sleep(0.5)
 
+    # ═══════════════════════════════════════════════════════════════
+    # ★ is_alive 方法 — 必须保留！
+    # ═══════════════════════════════════════════════════════════════
     async def is_alive(self) -> bool:
         try:
             if self.page.is_closed():
@@ -1261,7 +1208,7 @@ class BrowserManager:
         return full
 
     # ═══════════════════════════════════════════════════════════════
-    # 流式接口 — 和旧版完全一样的结构
+    # 流式接口
     # ═══════════════════════════════════════════════════════════════
     async def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
         if not self._ready:
@@ -1354,11 +1301,11 @@ class BrowserManager:
             yield "抱歉，未能获取到响应。请稍后重试。"
 
     # ═══════════════════════════════════════════════════════════════
-    # 核心等待逻辑 — ★ 唯一改动：用文件上传代替 type_and_send
+    # 核心等待逻辑 — ★ 用文件上传代替 type_and_send
     # ═══════════════════════════════════════════════════════════════
     async def _do_send_and_wait(
         self, cp: ChatPage, message: str, req_id: int, retry_num: int
-    ) -> tuple[Optional[str], Optional[str]]:
+    ) -> tuple:
         cp.request_count += 1
 
         # 检查存活
@@ -1382,7 +1329,7 @@ class BrowserManager:
             print(f"  [#{req_id}] ⚠️ 专家模式未能激活，将以当前模式继续")
         await asyncio.sleep(0.3)
 
-        # ═══ ★ 核心改动：所有消息都通过文件上传发送 ═══
+        # ═══ ★ 核心：所有消息都通过文件上传发送 ═══
         file_path = self._write_upload_file(message)
         print(f"  [#{req_id}] 📎 消息({len(message)}字符)，走文件上传模式")
 
@@ -1398,7 +1345,7 @@ class BrowserManager:
         print(f"  [#{req_id}] 已发送{retry_tag}")
 
         # ═══════════════════════════════════════════════════
-        # 核心等待循环 — 和旧版完全一样
+        # 核心等待循环
         # ═══════════════════════════════════════════════════
 
         max_wait = 600
@@ -1665,7 +1612,7 @@ class BrowserManager:
                     return "抱歉，未能获取到响应。请稍后重试。", "no_response"
 
     # ═══════════════════════════════════════════════════════════════
-    # 登录状态检测 & 自动重登录 — 和旧版完全一样
+    # 登录状态检测 & 自动重登录
     # ═══════════════════════════════════════════════════════════════
 
     async def check_login_status(self) -> bool:
@@ -1851,7 +1798,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "clipboard-first-v6.1-file-upload",
+            "mode": "clipboard-first-v6.2-file-upload-fixed",
             "has_token": True,
             "cookie_count": 0,
             "page_count": len(self._pages),
