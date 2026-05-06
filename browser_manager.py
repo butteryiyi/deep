@@ -1,10 +1,9 @@
 # browser_manager.py
 # 策略：生成中只监控+保存快照，完成后点复制按钮拿原生 Markdown
 # DOM 纯文本仅用于：审查检测、长度监控、兜底
-# v7: 基于v6 + 英文UI兼容 + 文件上传模式（绕过输入字数限制）
-#     Ctrl+J 快捷键开新对话（语言无关）
-#     专家模式中英文兼容
-#     超长内容自动走文件上传
+# v6.1: 基于旧版v6 — 唯一改动：所有消息都通过文件上传发送，不再粘贴到textarea
+#       保留：服务器错误检测 + 自动重试 + 页面恢复 + 登录检测/重登录
+#       保留：每次发送消息前自动点击"专家模式"按钮
 
 import os
 import sys
@@ -54,11 +53,8 @@ SERVER_ERROR_PHRASES = [
     "Service Unavailable",
 ]
 
-# ★ 新增：上传文件的固定临时路径（只用一个文件，每次覆盖）
+# ★ 上传文件的固定临时路径
 _UPLOAD_TMP_PATH = os.path.join(tempfile.gettempdir(), "ds_upload_prompt.txt")
-
-# ★ 新增：超过此字数则走文件上传模式（网页textarea有字数限制）
-_INPUT_CHAR_LIMIT = int(os.getenv("INPUT_CHAR_LIMIT", "2000"))
 
 
 def _is_censored(text: str) -> bool:
@@ -290,11 +286,9 @@ CLICK_REGENERATE_JS = """
 
 # ═══════════════════════════════════════════════════════════════
 # 点击专家模式按钮
-# ★ 改动：策略2/3/4 增加英文匹配
 # ═══════════════════════════════════════════════════════════════
 CLICK_EXPERT_MODE_JS = """
 () => {
-    // 策略1: 通过 data-model-type="expert" 属性精确定位（语言无关）
     const expertByAttr = document.querySelector('[data-model-type="expert"]');
     if (expertByAttr) {
         const isChecked = expertByAttr.getAttribute('aria-checked');
@@ -305,7 +299,6 @@ CLICK_EXPERT_MODE_JS = """
         return { status: 'clicked', method: 'data-attr' };
     }
 
-    // 策略2: 通过文本内容查找（中文+英文）
     const allRadios = document.querySelectorAll('div[role="radio"]');
     for (const div of allRadios) {
         const text = (div.innerText || '').trim();
@@ -319,7 +312,6 @@ CLICK_EXPERT_MODE_JS = """
         }
     }
 
-    // 策略3: 通过类名 _9f2341b 查找（中文+英文）
     const byClass = document.querySelectorAll('div._9f2341b');
     for (const el of byClass) {
         const text = (el.innerText || '').trim();
@@ -333,7 +325,6 @@ CLICK_EXPERT_MODE_JS = """
         }
     }
 
-    // 策略4: 遍历所有包含目标文本的可点击元素（中文+英文）
     const targetTexts = ['专家模式', 'Expert Mode', 'Expert mode', 'expert mode'];
     const allClickables = document.querySelectorAll('div, span, button, a');
     for (const el of allClickables) {
@@ -375,11 +366,9 @@ CLICK_EXPERT_MODE_JS = """
 
 # ═══════════════════════════════════════════════════════════════
 # 检查专家模式是否已选中
-# ★ 改动：增加英文匹配
 # ═══════════════════════════════════════════════════════════════
 CHECK_EXPERT_MODE_JS = """
 () => {
-    // 检查 data-model-type="expert" 的元素（语言无关）
     const expertEl = document.querySelector('[data-model-type="expert"]');
     if (expertEl) {
         return {
@@ -388,7 +377,6 @@ CHECK_EXPERT_MODE_JS = """
         };
     }
 
-    // 备用: 通过文本查找（中文+英文）
     const radios = document.querySelectorAll('div[role="radio"]');
     for (const radio of radios) {
         const text = (radio.innerText || '').trim();
@@ -401,6 +389,36 @@ CHECK_EXPERT_MODE_JS = """
     }
 
     return { found: false, checked: false };
+}
+"""
+
+# ═══════════════════════════════════════════════════════════════
+# ★ 等待文件上传完成的JS — 检测附件预览区域是否出现了文件卡片
+# ═══════════════════════════════════════════════════════════════
+CHECK_FILE_ATTACHED_JS = """
+() => {
+    // 检查是否有文件预览卡片（上传成功后会显示文件名+大小）
+    const fileCards = document.querySelectorAll(
+        '[class*="file-item"], [class*="file-card"], [class*="attachment"], ' +
+        '[class*="upload-item"], [class*="file-preview"]'
+    );
+    if (fileCards.length > 0) return { attached: true, count: fileCards.length, method: 'class' };
+
+    // 检查是否有包含 .txt / KB / MB 等文字的预览元素
+    const allEls = document.querySelectorAll('div, span');
+    for (const el of allEls) {
+        const text = (el.innerText || '').trim();
+        if (text.includes('ds_upload_prompt') || 
+            (text.includes('.txt') && (text.includes('KB') || text.includes('MB') || text.includes('B')))) {
+            // 确认这不是对话区的内容
+            const inChat = el.closest('div[data-virtual-list-item-key]');
+            if (!inChat) {
+                return { attached: true, count: 1, method: 'text-detect' };
+            }
+        }
+    }
+
+    return { attached: false, count: 0, method: 'none' };
 }
 """
 
@@ -509,6 +527,7 @@ class ChatPage:
             return f"error:{e}"
 
     async def click_expert_mode(self) -> dict:
+        """点击专家模式按钮，返回操作结果"""
         try:
             result = await asyncio.wait_for(
                 self.page.evaluate(CLICK_EXPERT_MODE_JS),
@@ -522,6 +541,7 @@ class ChatPage:
             return {"status": f"error:{e}", "method": "none"}
 
     async def check_expert_mode(self) -> dict:
+        """检查专家模式是否已选中"""
         try:
             result = await asyncio.wait_for(
                 self.page.evaluate(CHECK_EXPERT_MODE_JS),
@@ -561,6 +581,7 @@ class ChatPage:
             return False
 
     async def check_server_error(self) -> tuple[bool, str]:
+        """检查页面是否存在服务器错误提示"""
         try:
             state = await self.read_state()
             error_text = state.get("errorText", "")
@@ -606,9 +627,6 @@ class ChatPage:
         except Exception as e:
             return False, f"check_error_failed:{e}"
 
-    # ═══════════════════════════════════════════════════════════════
-    # ★ 改动：start_new_chat 优先用 Ctrl+J 快捷键，兼容中英文
-    # ═══════════════════════════════════════════════════════════════
     async def start_new_chat(self):
         self._hook_installed = False
         if "chat.deepseek.com" not in (self.page.url or ""):
@@ -618,15 +636,22 @@ class ChatPage:
             )
             await asyncio.sleep(2)
 
-        # ★ 优先用 Ctrl+J 快捷键开新对话（不依赖语言）
+        # 优先用 Ctrl+J 快捷键开新对话
         try:
             await self.page.keyboard.press("Control+j")
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1)
+            textarea = self.page.locator("textarea").first
+            try:
+                val = await textarea.input_value()
+                if val == "" or val is None:
+                    return
+            except Exception:
+                pass
             return
         except Exception:
             pass
 
-        # ★ 兜底：文本匹配，兼容中英文
+        # 兜底：文本匹配
         for sel in [
             "xpath=//*[contains(text(), '开启新对话')]",
             "xpath=//*[contains(text(), '新对话')]",
@@ -651,81 +676,121 @@ class ChatPage:
         await asyncio.sleep(3)
 
     # ═══════════════════════════════════════════════════════════════
-    # ★ 新增：通过文件上传按钮上传文件
+    # ★ 新增：通过 input[type=file] 上传文件（最可靠的方式）
     # ═══════════════════════════════════════════════════════════════
-    async def upload_file(self, file_path: str) -> bool:
+    async def upload_file_and_send(self, file_path: str, trigger_text: str) -> bool:
         """
-        通过附件按钮上传文件。
-        优先找隐藏的 input[type=file]，找不到就通过 file_chooser 事件。
+        上传文件 + 输入触发语 + 按回车发送。
+        返回 True 表示成功发送，False 表示上传失败。
         """
+        # ── 第1步：通过 input[type=file] 设置文件 ──
+        uploaded = False
         try:
-            # 方案1: 直接找 <input type="file"> 设置文件（最可靠）
             file_input = self.page.locator('input[type="file"]')
             count = await file_input.count()
             if count > 0:
-                await file_input.first.set_input_files(file_path)
-                await asyncio.sleep(1.5)
-                # 等待文件上传完成（检查是否出现文件名预览）
-                await asyncio.sleep(1)
-                return True
-        except Exception:
-            pass
+                # 可能有多个 input[type=file]，逐个尝试
+                for i in range(count):
+                    try:
+                        await file_input.nth(i).set_input_files(file_path)
+                        uploaded = True
+                        break
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"  ⚠️ P#{self.page_id} set_input_files 失败: {e}")
 
-        try:
-            # 方案2: 通过 expect_file_chooser 拦截文件对话框
-            async with self.page.expect_file_chooser(timeout=5000) as fc_info:
-                # 点击上传按钮（附件图标）
-                click_result = await self.page.evaluate("""
-                    () => {
-                        // 找 textarea 所在的输入区域容器
-                        const textarea = document.querySelector('textarea');
-                        if (!textarea) return 'no-textarea';
-
-                        // 向上找包含容器
-                        let container = textarea.parentElement;
-                        for (let i = 0; i < 5 && container; i++) {
-                            container = container.parentElement;
-                        }
-                        if (!container) container = textarea.parentElement;
-
-                        // 在容器内找所有图标按钮
-                        const btns = container.querySelectorAll(
-                            'div.ds-icon-button, [class*="upload"], [class*="attach"], [class*="file-btn"]'
-                        );
-                        for (const btn of btns) {
-                            const svg = btn.querySelector('svg');
-                            if (svg) {
-                                btn.click();
-                                return 'clicked';
+        if not uploaded:
+            # 兜底：通过 expect_file_chooser
+            try:
+                async with self.page.expect_file_chooser(timeout=5000) as fc_info:
+                    # 点击附件按钮（回形针图标）
+                    await self.page.evaluate("""
+                        () => {
+                            // 找 textarea 区域附近的上传按钮
+                            const textarea = document.querySelector('textarea');
+                            if (!textarea) return;
+                            let container = textarea;
+                            for (let i = 0; i < 8; i++) {
+                                if (container.parentElement) container = container.parentElement;
+                            }
+                            const btns = container.querySelectorAll('div.ds-icon-button');
+                            for (const btn of btns) {
+                                const svg = btn.querySelector('svg');
+                                if (svg) {
+                                    btn.click();
+                                    return;
+                                }
                             }
                         }
+                    """)
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(file_path)
+                uploaded = True
+            except Exception as e:
+                print(f"  ⚠️ P#{self.page_id} file_chooser 方式也失败: {e}")
 
-                        // 兜底：找所有带 upload/attach 相关的可点击元素
-                        const allBtns = document.querySelectorAll(
-                            '[class*="upload"], [class*="attach"], [class*="paperclip"]'
-                        );
-                        for (const btn of allBtns) {
-                            btn.click();
-                            return 'clicked-fallback';
-                        }
-
-                        return 'not-found';
-                    }
-                """)
-
-                if click_result == 'not-found':
-                    return False
-
-            file_chooser = await fc_info.value
-            await file_chooser.set_files(file_path)
-            await asyncio.sleep(2)
-            return True
-
-        except Exception as e:
-            print(f"  ⚠️ P#{self.page_id} 文件上传失败: {e}")
+        if not uploaded:
             return False
 
+        # ── 第2步：等待文件附件出现在输入区域 ──
+        attach_ok = False
+        for _ in range(20):  # 最多等 10 秒
+            await asyncio.sleep(0.5)
+            try:
+                check = await asyncio.wait_for(
+                    self.page.evaluate(CHECK_FILE_ATTACHED_JS),
+                    timeout=5
+                )
+                if check.get("attached"):
+                    attach_ok = True
+                    break
+            except Exception:
+                continue
+
+        if not attach_ok:
+            print(f"  ⚠️ P#{self.page_id} 文件上传后未检测到附件预览，仍尝试发送")
+
+        # ── 第3步：在 textarea 输入触发语并发送 ──
+        await asyncio.sleep(0.3)
+        textarea = self.page.locator("textarea").first
+        try:
+            await textarea.wait_for(state="visible", timeout=5000)
+            await textarea.click()
+            await asyncio.sleep(0.2)
+            await textarea.fill(trigger_text)
+        except Exception:
+            try:
+                await self.page.evaluate("""
+                    (text) => {
+                        const el = document.querySelector('textarea');
+                        if (!el) return;
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, 'value'
+                        ).set;
+                        setter.call(el, text);
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                """, trigger_text)
+            except Exception as e2:
+                print(f"  ⚠️ P#{self.page_id} 输入触发语失败: {e2}")
+
+        await asyncio.sleep(0.3)
+
+        # 按回车发送
+        try:
+            await textarea.press("Enter")
+        except Exception:
+            try:
+                await self.page.keyboard.press("Enter")
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+        return True
+
     async def type_and_send(self, message: str):
+        """原版：直接在 textarea 输入文字并发送"""
         textarea = self.page.locator("textarea").first
         await textarea.wait_for(state="visible", timeout=10000)
         await textarea.click()
@@ -761,7 +826,7 @@ class ChatPage:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SSE 心跳标记 — 用于保活，不携带任何内容
+# SSE 心跳标记
 # ═══════════════════════════════════════════════════════════════
 HEARTBEAT_MARKER = "\x00__HEARTBEAT__\x00"
 
@@ -790,11 +855,10 @@ class BrowserManager:
         self._ready_event = asyncio.Event()
         self._camoufox_ctx = None
 
-        # 错误统计
         self._consecutive_errors = 0
         self._last_error_time = 0.0
 
-        # ★ 新增：文件上传触发语（上传文件后在textarea里输入这句话触发发送）
+        # ★ 文件上传触发语
         self._upload_trigger_text = os.getenv(
             "UPLOAD_TRIGGER_TEXT",
             "请根据我上传的文件内容回复"
@@ -969,6 +1033,7 @@ class BrowserManager:
         self._page_semaphore.release()
 
     async def _recover_page(self, cp: ChatPage):
+        """恢复一个异常的页面到可用状态"""
         print(f"  🔄 正在恢复页面#{cp.page_id}...")
         try:
             if not await cp.is_alive():
@@ -995,10 +1060,9 @@ class BrowserManager:
             print(f"  ❌ 页面#{cp.page_id} 恢复失败: {e}")
 
     # ═══════════════════════════════════════════════════════════════
-    # ★ 新增：将内容写入临时文件（同一个文件，覆盖写入，不会累积）
+    # ★ 将内容写入临时文件
     # ═══════════════════════════════════════════════════════════════
     def _write_upload_file(self, content: str) -> str:
-        """将内容覆盖写入固定临时文件，返回文件路径"""
         with open(_UPLOAD_TMP_PATH, "w", encoding="utf-8") as f:
             f.write(content)
         return _UPLOAD_TMP_PATH
@@ -1014,7 +1078,7 @@ class BrowserManager:
         return full
 
     # ═══════════════════════════════════════════════════════════════
-    # 流式接口
+    # 流式接口 — 和旧版完全一样的结构
     # ═══════════════════════════════════════════════════════════════
     async def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
         if not self._ready:
@@ -1107,20 +1171,21 @@ class BrowserManager:
             yield "抱歉，未能获取到响应。请稍后重试。"
 
     # ═══════════════════════════════════════════════════════════════
-    # ★ 改动：核心发送逻辑 — 超长内容走文件上传，短内容直接输入
+    # 核心等待逻辑 — ★ 唯一改动：用文件上传代替 type_and_send
     # ═══════════════════════════════════════════════════════════════
     async def _do_send_and_wait(
         self, cp: ChatPage, message: str, req_id: int, retry_num: int
     ) -> tuple[Optional[str], Optional[str]]:
         cp.request_count += 1
 
+        # 检查存活
         if not await cp.is_alive():
             print(f"  [#{req_id}] 页面死亡，恢复中...")
             await self._recover_page(cp)
             if not await cp.is_alive():
                 return "[错误] 页面恢复失败", "exception"
 
-        # 新对话
+        # 新对话 + 安装 hook
         await cp.start_new_chat()
         await asyncio.sleep(0.5)
         await cp.ensure_clipboard_hook()
@@ -1134,30 +1199,23 @@ class BrowserManager:
             print(f"  [#{req_id}] ⚠️ 专家模式未能激活，将以当前模式继续")
         await asyncio.sleep(0.3)
 
-        # ═══ ★ 新增：根据消息长度决定发送方式 ═══
-        if len(message) > _INPUT_CHAR_LIMIT:
-            # 超长内容 → 写入临时文件 → 上传 → 发触发语
-            print(f"  [#{req_id}] 📎 消息过长({len(message)}字符)，走文件上传模式")
-            file_path = self._write_upload_file(message)
-            upload_ok = await cp.upload_file(file_path)
-            if upload_ok:
-                print(f"  [#{req_id}] 📎 文件上传成功")
-                await asyncio.sleep(0.5)
-                await cp.type_and_send(self._upload_trigger_text)
-            else:
-                # 上传失败，尝试截断直接输入
-                print(f"  [#{req_id}] ⚠️ 文件上传失败，尝试截断直接输入")
-                truncated = message[:_INPUT_CHAR_LIMIT - 100] + "\n\n...(内容过长已截断)"
-                await cp.type_and_send(truncated)
-        else:
-            # 短内容 → 直接输入
-            await cp.type_and_send(message)
+        # ═══ ★ 核心改动：所有消息都通过文件上传发送 ═══
+        file_path = self._write_upload_file(message)
+        print(f"  [#{req_id}] 📎 消息({len(message)}字符)，走文件上传模式")
+
+        upload_ok = await cp.upload_file_and_send(file_path, self._upload_trigger_text)
+
+        if not upload_ok:
+            # 文件上传失败，回退到直接输入（截断）
+            print(f"  [#{req_id}] ⚠️ 文件上传失败，回退直接输入")
+            truncated = message[:8000] if len(message) > 8000 else message
+            await cp.type_and_send(truncated)
 
         retry_tag = f" (重试#{retry_num})" if retry_num > 0 else ""
         print(f"  [#{req_id}] 已发送{retry_tag}")
 
         # ═══════════════════════════════════════════════════
-        # 核心等待循环 — 和之前完全一样
+        # 核心等待循环 — 和旧版完全一样
         # ═══════════════════════════════════════════════════
 
         max_wait = 600
@@ -1171,10 +1229,12 @@ class BrowserManager:
         final_text = None
         error_type = None
 
+        # DOM 归零检测
         dom_zero_count = 0
         dom_was_positive = False
         dom_zero_start_time = 0.0
 
+        # 等第二个 item 出现（AI 开始回复）
         for _ in range(60):
             await asyncio.sleep(0.5)
             st = await cp.read_state()
@@ -1199,9 +1259,11 @@ class BrowserManager:
             await asyncio.sleep(poll_interval)
             scroll_counter += 1
 
+            # 定期滚动到底部
             if scroll_counter % 12 == 0:
                 await cp.scroll_to_bottom()
 
+            # 读状态
             state = await cp.read_state()
             dom_text = state.get("domText", "")
             dom_len = state.get("domLen", 0)
@@ -1213,6 +1275,7 @@ class BrowserManager:
             has_error = state.get("hasError", False)
             error_text = state.get("errorText", "")
 
+            # ══ 服务器错误检测 ══
             if has_error:
                 print(f"  [#{req_id}] ❌ 检测到服务器错误: {error_text}")
                 if best_dom_text:
@@ -1235,15 +1298,18 @@ class BrowserManager:
                         error_type = "server_error"
                     break
 
+            # 检测生成开始
             if not gen_started and (dom_len > 0 or think_len > 0 or is_gen):
                 gen_started = True
                 no_change_count = 0
                 print(f"  [#{req_id}] 🚀 开始 "
                       f"(think={think_len} reply={dom_len})")
 
+            # ══ 持续保存 DOM 纯文本快照 ══
             if dom_len > len(best_dom_text):
                 best_dom_text = dom_text
 
+            # ══ DOM 突然归零检测 ══
             if gen_started and dom_len > 0:
                 dom_was_positive = True
                 dom_zero_count = 0
@@ -1276,6 +1342,7 @@ class BrowserManager:
                         error_type = "server_error"
                         break
 
+            # ── 审查检测（生成中） ──
             if (gen_started and len(best_dom_text) > 80
                 and dom_text and dom_len < len(best_dom_text) * 0.4
                 and _is_censored(dom_text)):
@@ -1284,12 +1351,15 @@ class BrowserManager:
                 final_text = best_dom_text
                 break
 
+            # ── 完成检测 ──
             if gen_started and is_complete and has_button and btn_count >= 3:
+                # 再确认一次
                 await asyncio.sleep(0.3)
                 confirm = await cp.read_state()
                 if not (confirm.get("isComplete") and confirm.get("hasButton")):
                     continue
 
+                # 完成时也检查错误
                 if confirm.get("hasError"):
                     err = confirm.get("errorText", "")
                     print(f"  [#{req_id}] ❌ 完成时检测到错误: {err}")
@@ -1299,15 +1369,18 @@ class BrowserManager:
                     error_type = "server_error"
                     break
 
+                # 滚到底确保完整
                 await cp.scroll_to_bottom()
                 await asyncio.sleep(0.2)
                 final_state = await cp.read_state()
                 final_dom = final_state.get("domText", "")
                 final_dom_len = final_state.get("domLen", 0)
 
+                # 更新快照
                 if final_dom_len > len(best_dom_text):
                     best_dom_text = final_dom
 
+                # ══ 检查完成时 DOM 是否已被审查替换 ══
                 if (_is_censored(final_dom) and
                     len(best_dom_text) > final_dom_len * 2):
                     print(f"  [#{req_id}] 🛡️ 完成时已审查! "
@@ -1315,6 +1388,7 @@ class BrowserManager:
                     final_text = best_dom_text
                     break
 
+                # ══ 点复制按钮拿 Markdown ══
                 clip_text = await cp.click_copy_and_wait(timeout=3.0)
 
                 if clip_text and not _is_censored(clip_text):
@@ -1334,6 +1408,7 @@ class BrowserManager:
                           f"用dom={len(final_text or '')}")
                 break
 
+            # ── 无进展检测 ──
             if dom_len == prev_len:
                 no_change_count += 1
             else:
@@ -1368,6 +1443,7 @@ class BrowserManager:
                         error_type = "no_response"
                     break
 
+            # 日志
             if scroll_counter % 37 == 0:
                 err_info = f" err={error_text[:30]}" if error_text else ""
                 print(f"  [#{req_id}] ⏳ {elapsed:.0f}s "
@@ -1382,6 +1458,7 @@ class BrowserManager:
         if final_text:
             return final_text, error_type
         else:
+            # 兜底
             clip = await cp.click_copy_and_wait(timeout=5.0)
             if clip and not _is_censored(clip):
                 print(f"  [#{req_id}] 📋 兜底复制: {len(clip)} 字")
@@ -1405,7 +1482,7 @@ class BrowserManager:
                     return "抱歉，未能获取到响应。请稍后重试。", "no_response"
 
     # ═══════════════════════════════════════════════════════════════
-    # 登录状态检测 & 自动重登录
+    # 登录状态检测 & 自动重登录 — 和旧版完全一样
     # ═══════════════════════════════════════════════════════════════
 
     async def check_login_status(self) -> bool:
@@ -1591,7 +1668,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "clipboard-first-v7-file-upload",
+            "mode": "clipboard-first-v6.1-file-upload",
             "has_token": True,
             "cookie_count": 0,
             "page_count": len(self._pages),
@@ -1603,7 +1680,6 @@ class BrowserManager:
             "requests_handled": self.requests_handled,
             "total_requests": self.total_requests,
             "consecutive_errors": self._consecutive_errors,
-            "input_char_limit": _INPUT_CHAR_LIMIT,
             "timestamp": datetime.now().isoformat(),
         }
 
