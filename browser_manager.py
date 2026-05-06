@@ -1,9 +1,10 @@
 # browser_manager.py
 # 策略：生成中只监控+保存快照，完成后点复制按钮拿原生 Markdown
 # DOM 纯文本仅用于：审查检测、长度监控、兜底
-# v6: 回归旧版稳定发送模式（非流式积攒） + SSE心跳保活解决超时
-#     保留：服务器错误检测 + 自动重试 + 页面恢复 + 登录检测/重登录
-#     新增：每次发送消息前自动点击"专家模式"按钮
+# v7: 基于v6 + 英文UI兼容 + 文件上传模式（绕过输入字数限制）
+#     Ctrl+J 快捷键开新对话（语言无关）
+#     专家模式中英文兼容
+#     超长内容自动走文件上传
 
 import os
 import sys
@@ -12,6 +13,7 @@ import json
 import asyncio
 import base64
 import shutil
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import AsyncGenerator, Optional
@@ -51,6 +53,12 @@ SERVER_ERROR_PHRASES = [
     "服务暂时不可用",
     "Service Unavailable",
 ]
+
+# ★ 新增：上传文件的固定临时路径（只用一个文件，每次覆盖）
+_UPLOAD_TMP_PATH = os.path.join(tempfile.gettempdir(), "ds_upload_prompt.txt")
+
+# ★ 新增：超过此字数则走文件上传模式（网页textarea有字数限制）
+_INPUT_CHAR_LIMIT = int(os.getenv("INPUT_CHAR_LIMIT", "2000"))
 
 
 def _is_censored(text: str) -> bool:
@@ -282,7 +290,7 @@ CLICK_REGENERATE_JS = """
 
 # ═══════════════════════════════════════════════════════════════
 # 点击专家模式按钮
-# ★ 改动：策略2/3/4 增加英文 "Expert Mode" / "Expert mode" / "Expert" 匹配
+# ★ 改动：策略2/3/4 增加英文匹配
 # ═══════════════════════════════════════════════════════════════
 CLICK_EXPERT_MODE_JS = """
 () => {
@@ -297,7 +305,7 @@ CLICK_EXPERT_MODE_JS = """
         return { status: 'clicked', method: 'data-attr' };
     }
 
-    // 策略2: 通过文本内容查找（中文+英文）  ★ 改动
+    // 策略2: 通过文本内容查找（中文+英文）
     const allRadios = document.querySelectorAll('div[role="radio"]');
     for (const div of allRadios) {
         const text = (div.innerText || '').trim();
@@ -311,7 +319,7 @@ CLICK_EXPERT_MODE_JS = """
         }
     }
 
-    // 策略3: 通过类名 _9f2341b 查找（中文+英文）  ★ 改动
+    // 策略3: 通过类名 _9f2341b 查找（中文+英文）
     const byClass = document.querySelectorAll('div._9f2341b');
     for (const el of byClass) {
         const text = (el.innerText || '').trim();
@@ -325,7 +333,7 @@ CLICK_EXPERT_MODE_JS = """
         }
     }
 
-    // 策略4: 遍历所有包含目标文本的可点击元素（中文+英文）  ★ 改动
+    // 策略4: 遍历所有包含目标文本的可点击元素（中文+英文）
     const targetTexts = ['专家模式', 'Expert Mode', 'Expert mode', 'expert mode'];
     const allClickables = document.querySelectorAll('div, span, button, a');
     for (const el of allClickables) {
@@ -367,7 +375,7 @@ CLICK_EXPERT_MODE_JS = """
 
 # ═══════════════════════════════════════════════════════════════
 # 检查专家模式是否已选中
-# ★ 改动：增加英文 "Expert Mode" / "Expert mode" / "Expert" 匹配
+# ★ 改动：增加英文匹配
 # ═══════════════════════════════════════════════════════════════
 CHECK_EXPERT_MODE_JS = """
 () => {
@@ -380,7 +388,7 @@ CHECK_EXPERT_MODE_JS = """
         };
     }
 
-    // 备用: 通过文本查找（中文+英文）  ★ 改动
+    // 备用: 通过文本查找（中文+英文）
     const radios = document.querySelectorAll('div[role="radio"]');
     for (const radio of radios) {
         const text = (radio.innerText || '').trim();
@@ -501,7 +509,6 @@ class ChatPage:
             return f"error:{e}"
 
     async def click_expert_mode(self) -> dict:
-        """点击专家模式按钮，返回操作结果"""
         try:
             result = await asyncio.wait_for(
                 self.page.evaluate(CLICK_EXPERT_MODE_JS),
@@ -515,7 +522,6 @@ class ChatPage:
             return {"status": f"error:{e}", "method": "none"}
 
     async def check_expert_mode(self) -> dict:
-        """检查专家模式是否已选中"""
         try:
             result = await asyncio.wait_for(
                 self.page.evaluate(CHECK_EXPERT_MODE_JS),
@@ -528,17 +534,10 @@ class ChatPage:
             return {"found": False, "checked": False}
 
     async def ensure_expert_mode(self) -> bool:
-        """
-        确保专家模式已选中。
-        返回 True 表示专家模式已激活（包括已经是选中状态），
-        返回 False 表示无法激活专家模式。
-        """
-        # 先检查当前状态
         check = await self.check_expert_mode()
         if check.get("checked"):
             return True
 
-        # 如果未选中，点击激活
         result = await self.click_expert_mode()
         status = result.get("status", "")
         method = result.get("method", "")
@@ -546,15 +545,12 @@ class ChatPage:
         if status == "already_selected":
             return True
         elif status == "clicked":
-            # 等待一小段时间让 UI 更新
             await asyncio.sleep(0.5)
-            # 验证是否成功切换
             verify = await self.check_expert_mode()
             if verify.get("checked"):
                 print(f"  🔷 P#{self.page_id} 专家模式已激活 (方式: {method})")
                 return True
             else:
-                # 有时候点击后 aria-checked 不会立即更新，但实际已生效
                 print(f"  🔷 P#{self.page_id} 专家模式已点击 (方式: {method})，验证状态未确认，继续执行")
                 return True
         elif status == "not_found":
@@ -565,9 +561,8 @@ class ChatPage:
             return False
 
     async def check_server_error(self) -> tuple[bool, str]:
-        """检查页面是否存在服务器错误提示（加超时保护）"""
         try:
-            state = await self.read_state()  # 已有超时保护
+            state = await self.read_state()
             error_text = state.get("errorText", "")
             has_error = state.get("hasError", False)
 
@@ -612,8 +607,7 @@ class ChatPage:
             return False, f"check_error_failed:{e}"
 
     # ═══════════════════════════════════════════════════════════════
-    # ★ 改动：start_new_chat 优先使用 Ctrl+J 快捷键（语言无关），
-    #         文本匹配作为兜底，同时兼容中英文
+    # ★ 改动：start_new_chat 优先用 Ctrl+J 快捷键，兼容中英文
     # ═══════════════════════════════════════════════════════════════
     async def start_new_chat(self):
         self._hook_installed = False
@@ -624,25 +618,15 @@ class ChatPage:
             )
             await asyncio.sleep(2)
 
-        # ★ 改动：优先用快捷键 Ctrl+J 开新对话（不依赖语言）
+        # ★ 优先用 Ctrl+J 快捷键开新对话（不依赖语言）
         try:
             await self.page.keyboard.press("Control+j")
-            await asyncio.sleep(1)
-            # 检查是否成功（页面上对话列表item数应该很少或textarea为空）
-            textarea = self.page.locator("textarea").first
-            try:
-                val = await textarea.input_value()
-                if val == "" or val is None:
-                    # 快捷键成功
-                    return
-            except Exception:
-                pass
-            # 即使无法验证，快捷键大概率成功，直接返回
+            await asyncio.sleep(1.5)
             return
         except Exception:
             pass
 
-        # ★ 改动：兜底方案 - 文本匹配，兼容中英文（含大小写变体）
+        # ★ 兜底：文本匹配，兼容中英文
         for sel in [
             "xpath=//*[contains(text(), '开启新对话')]",
             "xpath=//*[contains(text(), '新对话')]",
@@ -665,6 +649,81 @@ class ChatPage:
             wait_until="domcontentloaded", timeout=30000,
         )
         await asyncio.sleep(3)
+
+    # ═══════════════════════════════════════════════════════════════
+    # ★ 新增：通过文件上传按钮上传文件
+    # ═══════════════════════════════════════════════════════════════
+    async def upload_file(self, file_path: str) -> bool:
+        """
+        通过附件按钮上传文件。
+        优先找隐藏的 input[type=file]，找不到就通过 file_chooser 事件。
+        """
+        try:
+            # 方案1: 直接找 <input type="file"> 设置文件（最可靠）
+            file_input = self.page.locator('input[type="file"]')
+            count = await file_input.count()
+            if count > 0:
+                await file_input.first.set_input_files(file_path)
+                await asyncio.sleep(1.5)
+                # 等待文件上传完成（检查是否出现文件名预览）
+                await asyncio.sleep(1)
+                return True
+        except Exception:
+            pass
+
+        try:
+            # 方案2: 通过 expect_file_chooser 拦截文件对话框
+            async with self.page.expect_file_chooser(timeout=5000) as fc_info:
+                # 点击上传按钮（附件图标）
+                click_result = await self.page.evaluate("""
+                    () => {
+                        // 找 textarea 所在的输入区域容器
+                        const textarea = document.querySelector('textarea');
+                        if (!textarea) return 'no-textarea';
+
+                        // 向上找包含容器
+                        let container = textarea.parentElement;
+                        for (let i = 0; i < 5 && container; i++) {
+                            container = container.parentElement;
+                        }
+                        if (!container) container = textarea.parentElement;
+
+                        // 在容器内找所有图标按钮
+                        const btns = container.querySelectorAll(
+                            'div.ds-icon-button, [class*="upload"], [class*="attach"], [class*="file-btn"]'
+                        );
+                        for (const btn of btns) {
+                            const svg = btn.querySelector('svg');
+                            if (svg) {
+                                btn.click();
+                                return 'clicked';
+                            }
+                        }
+
+                        // 兜底：找所有带 upload/attach 相关的可点击元素
+                        const allBtns = document.querySelectorAll(
+                            '[class*="upload"], [class*="attach"], [class*="paperclip"]'
+                        );
+                        for (const btn of allBtns) {
+                            btn.click();
+                            return 'clicked-fallback';
+                        }
+
+                        return 'not-found';
+                    }
+                """)
+
+                if click_result == 'not-found':
+                    return False
+
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(file_path)
+            await asyncio.sleep(2)
+            return True
+
+        except Exception as e:
+            print(f"  ⚠️ P#{self.page_id} 文件上传失败: {e}")
+            return False
 
     async def type_and_send(self, message: str):
         textarea = self.page.locator("textarea").first
@@ -734,6 +793,12 @@ class BrowserManager:
         # 错误统计
         self._consecutive_errors = 0
         self._last_error_time = 0.0
+
+        # ★ 新增：文件上传触发语（上传文件后在textarea里输入这句话触发发送）
+        self._upload_trigger_text = os.getenv(
+            "UPLOAD_TRIGGER_TEXT",
+            "请根据我上传的文件内容回复"
+        )
 
     async def wait_until_ready(self, timeout: float = 180.0) -> bool:
         try:
@@ -904,7 +969,6 @@ class BrowserManager:
         self._page_semaphore.release()
 
     async def _recover_page(self, cp: ChatPage):
-        """恢复一个异常的页面到可用状态"""
         print(f"  🔄 正在恢复页面#{cp.page_id}...")
         try:
             if not await cp.is_alive():
@@ -931,6 +995,15 @@ class BrowserManager:
             print(f"  ❌ 页面#{cp.page_id} 恢复失败: {e}")
 
     # ═══════════════════════════════════════════════════════════════
+    # ★ 新增：将内容写入临时文件（同一个文件，覆盖写入，不会累积）
+    # ═══════════════════════════════════════════════════════════════
+    def _write_upload_file(self, content: str) -> str:
+        """将内容覆盖写入固定临时文件，返回文件路径"""
+        with open(_UPLOAD_TMP_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+        return _UPLOAD_TMP_PATH
+
+    # ═══════════════════════════════════════════════════════════════
     # 非流式接口
     # ═══════════════════════════════════════════════════════════════
     async def send_message(self, message: str) -> str:
@@ -941,15 +1014,9 @@ class BrowserManager:
         return full
 
     # ═══════════════════════════════════════════════════════════════
-    # 流式接口 — 回归旧版：生成中只发心跳保活，完成后一次性输出结果
+    # 流式接口
     # ═══════════════════════════════════════════════════════════════
     async def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
-        """
-        假流式输出：
-        - 后台线程完成全部工作（获取页面 → 发送 → 等待 → 重试 → 释放页面）
-        - 前台从第一秒起就持续发心跳，保证连接不被反向代理切断
-        - 后台完成后，一次性 yield 完整结果
-        """
         if not self._ready:
             ok = await self.wait_until_ready(timeout=180)
             if not ok:
@@ -961,15 +1028,12 @@ class BrowserManager:
         req_id = self.total_requests
         print(f"📨 #{req_id} ({len(message)} 字符)")
 
-        # ── 共享状态 ──
         done_event = asyncio.Event()
         holder = {"text": None, "error_type": None}
 
         async def _background_work():
-            """后台：获取页面 → 发送消息 → 等待结果 → 重试 → 释放页面"""
             cp = None
             try:
-                # 1) 获取空闲页面（缩短到 120s，因为心跳已经在跑了）
                 try:
                     cp = await asyncio.wait_for(self._acquire_page(), timeout=120)
                 except asyncio.TimeoutError:
@@ -983,7 +1047,6 @@ class BrowserManager:
 
                 print(f"  [#{req_id}] → 页面#{cp.page_id}")
 
-                # 2) 重试循环
                 max_retries = 2
                 for attempt in range(max_retries + 1):
                     text, err = await self._do_send_and_wait(
@@ -998,7 +1061,6 @@ class BrowserManager:
                         await self._recover_page(cp)
                         continue
 
-                    # 最终结果（成功或最后一次失败）
                     holder["text"] = text
                     holder["error_type"] = err
                     if err is None:
@@ -1008,7 +1070,6 @@ class BrowserManager:
                         self._last_error_time = time.time()
                     break
 
-                # 如果重试完还没设置 text
                 if holder["text"] is None and holder["error_type"] == "server_error":
                     holder["text"] = "[错误] 服务器繁忙，多次重试后仍然失败，请稍后重试。"
 
@@ -1021,30 +1082,24 @@ class BrowserManager:
             finally:
                 if cp:
                     self._release_page(cp)
-                done_event.set()  # ★ 无论如何都要 set，否则前台死循环
+                done_event.set()
 
-        # ── 启动后台任务 ──
         task = asyncio.create_task(_background_work())
 
-        # ── 前台：心跳保活（从此刻起立即开始） ──
-        heartbeat_interval = 3.0   # 每 3 秒一次，足够应对大多数代理超时
+        heartbeat_interval = 3.0
         while not done_event.is_set():
             try:
                 await asyncio.wait_for(done_event.wait(), timeout=heartbeat_interval)
-                # done_event 被 set 了，跳出循环
                 break
             except asyncio.TimeoutError:
-                # 还没完成，发一次心跳
                 yield HEARTBEAT_MARKER
 
-        # ── 确保后台任务真正完成 ──
         if not task.done():
             try:
                 await task
             except Exception:
-                pass  # 异常已在 _background_work 内部处理
+                pass
 
-        # ── 输出最终结果 ──
         final_text = holder.get("text")
         if final_text:
             yield final_text
@@ -1052,32 +1107,26 @@ class BrowserManager:
             yield "抱歉，未能获取到响应。请稍后重试。"
 
     # ═══════════════════════════════════════════════════════════════
-    # 核心等待逻辑 — 新增：发送消息前自动点击专家模式
+    # ★ 改动：核心发送逻辑 — 超长内容走文件上传，短内容直接输入
     # ═══════════════════════════════════════════════════════════════
     async def _do_send_and_wait(
         self, cp: ChatPage, message: str, req_id: int, retry_num: int
     ) -> tuple[Optional[str], Optional[str]]:
-        """
-        执行发送消息并等待响应。
-        返回: (result_text, error_type)
-            error_type: None=成功, "server_error"=可重试, "no_response"=无响应
-        """
         cp.request_count += 1
 
-        # 检查存活
         if not await cp.is_alive():
             print(f"  [#{req_id}] 页面死亡，恢复中...")
             await self._recover_page(cp)
             if not await cp.is_alive():
                 return "[错误] 页面恢复失败", "exception"
 
-        # 新对话 + 安装 hook
+        # 新对话
         await cp.start_new_chat()
         await asyncio.sleep(0.5)
         await cp.ensure_clipboard_hook()
         await cp.reset_clip()
 
-        # ═══ 新增：点击专家模式 ═══
+        # 专家模式
         expert_ok = await cp.ensure_expert_mode()
         if expert_ok:
             print(f"  [#{req_id}] 🔷 专家模式已确认激活")
@@ -1085,13 +1134,30 @@ class BrowserManager:
             print(f"  [#{req_id}] ⚠️ 专家模式未能激活，将以当前模式继续")
         await asyncio.sleep(0.3)
 
-        # 发送消息
-        await cp.type_and_send(message)
+        # ═══ ★ 新增：根据消息长度决定发送方式 ═══
+        if len(message) > _INPUT_CHAR_LIMIT:
+            # 超长内容 → 写入临时文件 → 上传 → 发触发语
+            print(f"  [#{req_id}] 📎 消息过长({len(message)}字符)，走文件上传模式")
+            file_path = self._write_upload_file(message)
+            upload_ok = await cp.upload_file(file_path)
+            if upload_ok:
+                print(f"  [#{req_id}] 📎 文件上传成功")
+                await asyncio.sleep(0.5)
+                await cp.type_and_send(self._upload_trigger_text)
+            else:
+                # 上传失败，尝试截断直接输入
+                print(f"  [#{req_id}] ⚠️ 文件上传失败，尝试截断直接输入")
+                truncated = message[:_INPUT_CHAR_LIMIT - 100] + "\n\n...(内容过长已截断)"
+                await cp.type_and_send(truncated)
+        else:
+            # 短内容 → 直接输入
+            await cp.type_and_send(message)
+
         retry_tag = f" (重试#{retry_num})" if retry_num > 0 else ""
         print(f"  [#{req_id}] 已发送{retry_tag}")
 
         # ═══════════════════════════════════════════════════
-        # 核心等待循环 — 只监控，不输出
+        # 核心等待循环 — 和之前完全一样
         # ═══════════════════════════════════════════════════
 
         max_wait = 600
@@ -1105,12 +1171,10 @@ class BrowserManager:
         final_text = None
         error_type = None
 
-        # DOM 归零检测
         dom_zero_count = 0
         dom_was_positive = False
         dom_zero_start_time = 0.0
 
-        # 等第二个 item 出现（AI 开始回复）
         for _ in range(60):
             await asyncio.sleep(0.5)
             st = await cp.read_state()
@@ -1135,11 +1199,9 @@ class BrowserManager:
             await asyncio.sleep(poll_interval)
             scroll_counter += 1
 
-            # 定期滚动到底部
             if scroll_counter % 12 == 0:
                 await cp.scroll_to_bottom()
 
-            # 读状态
             state = await cp.read_state()
             dom_text = state.get("domText", "")
             dom_len = state.get("domLen", 0)
@@ -1151,7 +1213,6 @@ class BrowserManager:
             has_error = state.get("hasError", False)
             error_text = state.get("errorText", "")
 
-            # ══ 服务器错误检测 ══
             if has_error:
                 print(f"  [#{req_id}] ❌ 检测到服务器错误: {error_text}")
                 if best_dom_text:
@@ -1174,18 +1235,15 @@ class BrowserManager:
                         error_type = "server_error"
                     break
 
-            # 检测生成开始
             if not gen_started and (dom_len > 0 or think_len > 0 or is_gen):
                 gen_started = True
                 no_change_count = 0
                 print(f"  [#{req_id}] 🚀 开始 "
                       f"(think={think_len} reply={dom_len})")
 
-            # ══ 持续保存 DOM 纯文本快照 ══
             if dom_len > len(best_dom_text):
                 best_dom_text = dom_text
 
-            # ══ DOM 突然归零检测 ══
             if gen_started and dom_len > 0:
                 dom_was_positive = True
                 dom_zero_count = 0
@@ -1218,7 +1276,6 @@ class BrowserManager:
                         error_type = "server_error"
                         break
 
-            # ── 审查检测（生成中） ──
             if (gen_started and len(best_dom_text) > 80
                 and dom_text and dom_len < len(best_dom_text) * 0.4
                 and _is_censored(dom_text)):
@@ -1227,15 +1284,12 @@ class BrowserManager:
                 final_text = best_dom_text
                 break
 
-            # ── 完成检测 ──
             if gen_started and is_complete and has_button and btn_count >= 3:
-                # 再确认一次
                 await asyncio.sleep(0.3)
                 confirm = await cp.read_state()
                 if not (confirm.get("isComplete") and confirm.get("hasButton")):
                     continue
 
-                # 完成时也检查错误
                 if confirm.get("hasError"):
                     err = confirm.get("errorText", "")
                     print(f"  [#{req_id}] ❌ 完成时检测到错误: {err}")
@@ -1245,18 +1299,15 @@ class BrowserManager:
                     error_type = "server_error"
                     break
 
-                # 滚到底确保完整
                 await cp.scroll_to_bottom()
                 await asyncio.sleep(0.2)
                 final_state = await cp.read_state()
                 final_dom = final_state.get("domText", "")
                 final_dom_len = final_state.get("domLen", 0)
 
-                # 更新快照
                 if final_dom_len > len(best_dom_text):
                     best_dom_text = final_dom
 
-                # ══ 检查完成时 DOM 是否已被审查替换 ══
                 if (_is_censored(final_dom) and
                     len(best_dom_text) > final_dom_len * 2):
                     print(f"  [#{req_id}] 🛡️ 完成时已审查! "
@@ -1264,7 +1315,6 @@ class BrowserManager:
                     final_text = best_dom_text
                     break
 
-                # ══ 点复制按钮拿 Markdown ══
                 clip_text = await cp.click_copy_and_wait(timeout=3.0)
 
                 if clip_text and not _is_censored(clip_text):
@@ -1284,7 +1334,6 @@ class BrowserManager:
                           f"用dom={len(final_text or '')}")
                 break
 
-            # ── 无进展检测 ──
             if dom_len == prev_len:
                 no_change_count += 1
             else:
@@ -1319,7 +1368,6 @@ class BrowserManager:
                         error_type = "no_response"
                     break
 
-            # 日志
             if scroll_counter % 37 == 0:
                 err_info = f" err={error_text[:30]}" if error_text else ""
                 print(f"  [#{req_id}] ⏳ {elapsed:.0f}s "
@@ -1334,7 +1382,6 @@ class BrowserManager:
         if final_text:
             return final_text, error_type
         else:
-            # 兜底
             clip = await cp.click_copy_and_wait(timeout=5.0)
             if clip and not _is_censored(clip):
                 print(f"  [#{req_id}] 📋 兜底复制: {len(clip)} 字")
@@ -1362,7 +1409,6 @@ class BrowserManager:
     # ═══════════════════════════════════════════════════════════════
 
     async def check_login_status(self) -> bool:
-        """检查当前是否仍处于登录状态"""
         for cp in self._pages:
             if cp.busy:
                 continue
@@ -1422,7 +1468,6 @@ class BrowserManager:
         return True
 
     async def re_login(self) -> bool:
-        """重新注入 Cookie 并刷新所有页面以恢复登录状态"""
         print("\n🔄 ========== 开始重新登录流程 ==========")
 
         target_cp = None
@@ -1498,7 +1543,6 @@ class BrowserManager:
                     pass
 
     async def refresh_idle_pages(self) -> int:
-        """刷新所有空闲页面以保持前端 SPA 状态"""
         refreshed = 0
         for cp in self._pages:
             if cp.busy:
@@ -1547,7 +1591,7 @@ class BrowserManager:
             "logged_in": self.logged_in,
             "ready": self._ready,
             "engine": self._engine,
-            "mode": "clipboard-first-v6-expert-mode",
+            "mode": "clipboard-first-v7-file-upload",
             "has_token": True,
             "cookie_count": 0,
             "page_count": len(self._pages),
@@ -1559,6 +1603,7 @@ class BrowserManager:
             "requests_handled": self.requests_handled,
             "total_requests": self.total_requests,
             "consecutive_errors": self._consecutive_errors,
+            "input_char_limit": _INPUT_CHAR_LIMIT,
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -1573,7 +1618,6 @@ class BrowserManager:
         return None
 
     async def simulate_activity(self):
-        """模拟用户活动：鼠标移动 + 可见性欺骗 + 轻量网络请求保持 session"""
         import random
         self.heartbeat_count += 1
 
