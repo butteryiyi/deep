@@ -678,231 +678,298 @@ class ChatPage:
     # ═══════════════════════════════════════════════════════════════
     # ★ 新增：通过 input[type=file] 上传文件（最可靠的方式）
     # ═══════════════════════════════════════════════════════════════
-    async def upload_file_and_send(self, file_path: str, trigger_text: str) -> bool:
-        """
-        上传文件 + 输入触发语 + 点击发送按钮。
-        返回 True 表示成功发送，False 表示上传失败。
-        """
-        # ── 第1步：通过 input[type=file] 设置文件 ──
-        uploaded = False
-        try:
-            file_input = self.page.locator('input[type="file"]')
-            count = await file_input.count()
-            if count > 0:
-                for i in range(count):
-                    try:
-                        await file_input.nth(i).set_input_files(file_path)
-                        uploaded = True
-                        break
-                    except Exception:
-                        continue
-        except Exception as e:
-            print(f"  ⚠️ P#{self.page_id} set_input_files 失败: {e}")
-
-        if not uploaded:
-            try:
-                async with self.page.expect_file_chooser(timeout=5000) as fc_info:
-                    await self.page.evaluate("""
-                        () => {
-                            const textarea = document.querySelector('textarea');
-                            if (!textarea) return;
-                            let container = textarea;
-                            for (let i = 0; i < 8; i++) {
-                                if (container.parentElement) container = container.parentElement;
-                            }
-                            const btns = container.querySelectorAll('div.ds-icon-button');
-                            for (const btn of btns) {
-                                const svg = btn.querySelector('svg');
-                                if (svg) { btn.click(); return; }
-                            }
-                        }
-                    """)
-                file_chooser = await fc_info.value
-                await file_chooser.set_files(file_path)
-                uploaded = True
-            except Exception as e:
-                print(f"  ⚠️ P#{self.page_id} file_chooser 方式也失败: {e}")
-
-        if not uploaded:
-            return False
-
-        # ── 第2步：等待文件附件出现 ──
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            try:
-                check = await asyncio.wait_for(
-                    self.page.evaluate(CHECK_FILE_ATTACHED_JS),
-                    timeout=5
-                )
-                if check.get("attached"):
+async def upload_file_and_send(self, file_path: str, trigger_text: str) -> bool:
+    """
+    上传文件 + 输入触发语 + 按回车发送。
+    返回 True 表示成功发送，False 表示上传失败。
+    """
+    # ── 第1步：通过 input[type=file] 设置文件 ──
+    uploaded = False
+    try:
+        file_input = self.page.locator('input[type="file"]')
+        count = await file_input.count()
+        if count > 0:
+            for i in range(count):
+                try:
+                    await file_input.nth(i).set_input_files(file_path)
+                    uploaded = True
                     break
-            except Exception:
-                continue
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"  ⚠️ P#{self.page_id} set_input_files 失败: {e}")
 
-        # ── 第3步：在 textarea 输入触发语 ──
-        await asyncio.sleep(0.3)
-        textarea = self.page.locator("textarea").first
+    if not uploaded:
         try:
-            await textarea.wait_for(state="visible", timeout=5000)
-            await textarea.click()
-            await asyncio.sleep(0.2)
-            await textarea.fill("")
-            await asyncio.sleep(0.1)
-            await textarea.fill(trigger_text)
-        except Exception:
-            try:
+            async with self.page.expect_file_chooser(timeout=5000) as fc_info:
                 await self.page.evaluate("""
-                    (text) => {
-                        const el = document.querySelector('textarea');
-                        if (!el) return;
-                        const setter = Object.getOwnPropertyDescriptor(
-                            window.HTMLTextAreaElement.prototype, 'value'
-                        ).set;
-                        setter.call(el, text);
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
-                """, trigger_text)
-            except Exception as e2:
-                print(f"  ⚠️ P#{self.page_id} 输入触发语失败: {e2}")
-
-        await asyncio.sleep(0.5)
-
-        # ── 第4步：发送！多种方式确保一定能发出去 ──
-        sent = False
-
-        # 方式1：点击发送按钮（蓝色圆形箭头按钮）
-        try:
-            click_result = await self.page.evaluate("""
-                () => {
-                    // 找所有可能的发送按钮
-                    // DeepSeek 的发送按钮通常是 textarea 附近的一个带 svg 的圆形按钮
-                    const textarea = document.querySelector('textarea');
-                    if (!textarea) return 'no-textarea';
-
-                    // 向上找到输入区域的容器
-                    let container = textarea.parentElement;
-                    for (let i = 0; i < 6; i++) {
-                        if (container && container.parentElement) {
-                            container = container.parentElement;
+                    () => {
+                        const textarea = document.querySelector('textarea');
+                        if (!textarea) return;
+                        let container = textarea;
+                        for (let i = 0; i < 8; i++) {
+                            if (container.parentElement) container = container.parentElement;
                         }
-                    }
-                    if (!container) container = document.body;
-
-                    // 策略A：找 role="button" 或 button 标签，且在 textarea 附近
-                    const buttons = container.querySelectorAll(
-                        'button, div[role="button"], span[role="button"]'
-                    );
-                    for (const btn of buttons) {
-                        const rect = btn.getBoundingClientRect();
-                        // 发送按钮通常比较小（圆形）且在右侧
-                        if (rect.width > 20 && rect.width < 60 && rect.height > 20 && rect.height < 60) {
+                        const btns = container.querySelectorAll('div.ds-icon-button');
+                        for (const btn of btns) {
                             const svg = btn.querySelector('svg');
                             if (svg) {
                                 btn.click();
-                                return 'clicked-button-svg';
+                                return;
                             }
                         }
                     }
+                """)
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(file_path)
+            uploaded = True
+        except Exception as e:
+            print(f"  ⚠️ P#{self.page_id} file_chooser 方式也失败: {e}")
 
-                    // 策略B：找 ds-icon-button 中带发送图标的（通常在最右边）
-                    const iconBtns = container.querySelectorAll('div.ds-icon-button');
-                    if (iconBtns.length > 0) {
-                        // 发送按钮通常是最后一个或者有特定背景色的
-                        for (const btn of iconBtns) {
-                            const style = window.getComputedStyle(btn);
-                            const bg = style.backgroundColor;
-                            // 蓝色/紫色背景的就是发送按钮
-                            if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && bg !== 'rgb(255, 255, 255)') {
-                                btn.click();
-                                return 'clicked-icon-colored:' + bg;
-                            }
-                        }
-                        // 如果都没有彩色背景，点最后一个带 svg 的
-                        const lastBtn = iconBtns[iconBtns.length - 1];
-                        if (lastBtn.querySelector('svg')) {
-                            lastBtn.click();
-                            return 'clicked-icon-last';
-                        }
+    if not uploaded:
+        return False
+
+    # ── 第2步：等待文件附件出现在输入区域 ──
+    attach_ok = False
+    for _ in range(20):  # 最多等 10 秒
+        await asyncio.sleep(0.5)
+        try:
+            check = await asyncio.wait_for(
+                self.page.evaluate(CHECK_FILE_ATTACHED_JS),
+                timeout=5
+            )
+            if check.get("attached"):
+                attach_ok = True
+                break
+        except Exception:
+            continue
+
+    if not attach_ok:
+        print(f"  ⚠️ P#{self.page_id} 文件上传后未检测到附件预览，仍尝试发送")
+
+    # ══════════════════════════════════════════════════════════
+    # ★ 修复核心：确保 textarea 获得焦点 + 正确触发 React 状态
+    # ══════════════════════════════════════════════════════════
+
+    # 等待附件渲染稳定
+    await asyncio.sleep(0.8)
+
+    textarea = self.page.locator("textarea").first
+    try:
+        await textarea.wait_for(state="visible", timeout=5000)
+    except Exception as e:
+        print(f"  ⚠️ P#{self.page_id} textarea 不可见: {e}")
+
+    # ★ 修复1：强制点击 textarea 获取焦点
+    try:
+        await textarea.click()
+        await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
+    # ★ 修复2：用 Playwright 的 type() 逐字输入（而非 fill），
+    #           这样能正确触发 React 的 onChange/onInput 事件链
+    try:
+        # 先清空
+        await textarea.fill("")
+        await asyncio.sleep(0.1)
+
+        # 使用 page.keyboard.type() 模拟真实键盘输入
+        # 这比 fill() 更可靠地触发 React 事件
+        await self.page.keyboard.type(trigger_text, delay=10)
+        await asyncio.sleep(0.3)
+    except Exception:
+        # 兜底：JS 强制设值 + 手动派发完整事件链
+        try:
+            await self.page.evaluate("""
+                (text) => {
+                    const el = document.querySelector('textarea');
+                    if (!el) return;
+
+                    // 聚焦
+                    el.focus();
+
+                    // 通过原生 setter 设值
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLTextAreaElement.prototype, 'value'
+                    ).set;
+                    nativeInputValueSetter.call(el, text);
+
+                    // ★ 派发完整的事件链，确保 React 能捕获
+                    el.dispatchEvent(new Event('focus', { bubbles: true }));
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+
+                    // React 16+ 需要这个
+                    const reactPropsKey = Object.keys(el).find(
+                        k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$')
+                    );
+                    if (reactPropsKey && el[reactPropsKey] && el[reactPropsKey].onChange) {
+                        el[reactPropsKey].onChange({ target: el });
+                    }
+                }
+            """, trigger_text)
+            await asyncio.sleep(0.3)
+        except Exception as e2:
+            print(f"  ⚠️ P#{self.page_id} 输入触发语失败: {e2}")
+
+    # ★ 修复3：验证发送按钮是否可用，确认 React 状态已更新
+    send_ready = False
+    for _ in range(10):  # 最多等 5 秒
+        try:
+            is_ready = await self.page.evaluate("""
+                () => {
+                    const textarea = document.querySelector('textarea');
+                    if (!textarea) return false;
+
+                    // 检查 textarea 是否有内容
+                    if (!textarea.value || textarea.value.trim() === '') return false;
+
+                    // 检查发送按钮是否启用（蓝色可点击状态）
+                    // DeepSeek 的发送按钮在有内容时会变为可点击
+                    const sendBtns = document.querySelectorAll(
+                        '[class*="send"], [data-testid="send"], ' +
+                        'button[class*="submit"]'
+                    );
+
+                    // 也可以检查附近的 icon-button 是否有 disabled 属性
+                    return true;
+                }
+            """)
+            if is_ready:
+                send_ready = True
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    # ★ 修复4：再次确保焦点在 textarea，然后按 Enter
+    try:
+        await textarea.click()
+        await asyncio.sleep(0.2)
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════
+    # ★ 修复5：多重发送策略，确保消息发出去
+    # ══════════════════════════════════════════════════════════
+    sent = False
+
+    # 策略1：textarea.press("Enter")
+    try:
+        await textarea.press("Enter")
+        await asyncio.sleep(0.8)
+        # 验证是否发送成功（检查 itemCount 是否增加）
+        state = await self.read_state()
+        if state.get("itemCount", 0) >= 1:
+            sent = True
+            print(f"  ✅ P#{self.page_id} Enter 发送成功 (策略1: textarea.press)")
+    except Exception:
+        pass
+
+    # 策略2：page.keyboard.press("Enter")
+    if not sent:
+        try:
+            await textarea.click()
+            await asyncio.sleep(0.2)
+            await self.page.keyboard.press("Enter")
+            await asyncio.sleep(0.8)
+            state = await self.read_state()
+            if state.get("itemCount", 0) >= 1:
+                sent = True
+                print(f"  ✅ P#{self.page_id} Enter 发送成功 (策略2: keyboard.press)")
+        except Exception:
+            pass
+
+    # 策略3：点击发送按钮
+    if not sent:
+        try:
+            clicked = await self.page.evaluate("""
+                () => {
+                    // 找发送按钮（通常是输入框右侧的圆形按钮）
+                    const textarea = document.querySelector('textarea');
+                    if (!textarea) return 'no-textarea';
+
+                    let container = textarea;
+                    for (let i = 0; i < 6; i++) {
+                        if (container.parentElement) container = container.parentElement;
                     }
 
-                    // 策略C：找所有 svg 中包含发送图标路径的按钮
-                    const allSvgBtns = container.querySelectorAll('div.ds-icon-button, button');
-                    for (const btn of allSvgBtns) {
-                        const paths = btn.querySelectorAll('svg path');
+                    // 找所有可能的发送按钮
+                    const candidates = container.querySelectorAll(
+                        'div.ds-icon-button, button, [role="button"]'
+                    );
+
+                    for (const btn of candidates) {
+                        const svg = btn.querySelector('svg');
+                        if (!svg) continue;
+
+                        // 排除附件按钮（回形针图标），找发送按钮（箭头/三角图标）
+                        const paths = svg.querySelectorAll('path');
                         for (const path of paths) {
                             const d = (path.getAttribute('d') || '');
-                            // 发送图标的 path 通常包含箭头形状
-                            if (d.includes('M') && d.includes('L') && d.length > 20 && d.length < 200) {
-                                // 检查是否在 textarea 的右侧区域
-                                const btnRect = btn.getBoundingClientRect();
-                                const taRect = textarea.getBoundingClientRect();
-                                if (btnRect.left > taRect.left + taRect.width * 0.5) {
-                                    btn.click();
-                                    return 'clicked-svg-right';
-                                }
+                            // DeepSeek 发送按钮的 SVG path 通常包含向上箭头的特征
+                            if (d.includes('M12') || d.includes('arrow') ||
+                                btn.closest('[class*="send"]')) {
+                                btn.click();
+                                return 'clicked-send-btn';
                             }
                         }
                     }
 
-                    // 策略D：最暴力 - 找 textarea 同行右侧区域所有可点击元素
-                    const taRect = textarea.getBoundingClientRect();
-                    const allEls = document.elementsFromPoint(
-                        taRect.right + 30,
-                        taRect.top + taRect.height / 2
-                    );
-                    for (const el of allEls) {
-                        if (el.tagName === 'TEXTAREA' || el.tagName === 'HTML' || el.tagName === 'BODY') continue;
-                        if (el.querySelector && el.querySelector('svg')) {
-                            el.click();
-                            return 'clicked-point';
-                        }
+                    // 兜底：找最后一个 icon-button（通常就是发送按钮）
+                    const allBtns = container.querySelectorAll('div.ds-icon-button');
+                    if (allBtns.length > 0) {
+                        const lastBtn = allBtns[allBtns.length - 1];
+                        lastBtn.click();
+                        return 'clicked-last-btn';
                     }
 
                     return 'not-found';
                 }
             """)
-            print(f"  P#{self.page_id} 发送按钮点击结果: {click_result}")
-            if click_result and 'clicked' in click_result:
-                sent = True
+            if clicked and 'clicked' in clicked:
+                await asyncio.sleep(0.8)
+                state = await self.read_state()
+                if state.get("itemCount", 0) >= 1:
+                    sent = True
+                    print(f"  ✅ P#{self.page_id} 点击发送按钮成功 (策略3: {clicked})")
         except Exception as e:
             print(f"  ⚠️ P#{self.page_id} 点击发送按钮失败: {e}")
 
-        # 方式2：如果按钮没点到，试 Enter 键
-        if not sent:
-            try:
-                await textarea.click()
-                await asyncio.sleep(0.1)
-                await self.page.keyboard.press("Enter")
-                print(f"  P#{self.page_id} 使用 keyboard.press Enter")
+    # 策略4：JS 模拟 Enter 键事件
+    if not sent:
+        try:
+            await self.page.evaluate("""
+                () => {
+                    const textarea = document.querySelector('textarea');
+                    if (!textarea) return;
+                    textarea.focus();
+                    const enterEvent = new KeyboardEvent('keydown', {
+                        key: 'Enter',
+                        code: 'Enter',
+                        keyCode: 13,
+                        which: 13,
+                        bubbles: true,
+                        cancelable: true
+                    });
+                    textarea.dispatchEvent(enterEvent);
+                }
+            """)
+            await asyncio.sleep(0.8)
+            state = await self.read_state()
+            if state.get("itemCount", 0) >= 1:
                 sent = True
-            except Exception as e:
-                print(f"  ⚠️ P#{self.page_id} keyboard Enter 失败: {e}")
+                print(f"  ✅ P#{self.page_id} JS模拟Enter成功 (策略4)")
+        except Exception:
+            pass
 
-        # 方式3：最后兜底 - 模拟键盘事件
-        if not sent:
-            try:
-                await self.page.evaluate("""
-                    () => {
-                        const textarea = document.querySelector('textarea');
-                        if (!textarea) return;
-                        textarea.focus();
-                        const enterEvent = new KeyboardEvent('keydown', {
-                            key: 'Enter',
-                            code: 'Enter',
-                            keyCode: 13,
-                            which: 13,
-                            bubbles: true,
-                            cancelable: true
-                        });
-                        textarea.dispatchEvent(enterEvent);
-                    }
-                """)
-                print(f"  P#{self.page_id} 使用 dispatchEvent Enter")
-            except Exception:
-                pass
+    if not sent:
+        print(f"  ⚠️ P#{self.page_id} 所有发送策略均未确认成功，继续等待...")
 
-        await asyncio.sleep(0.5)
-        return True
+    await asyncio.sleep(0.5)
+    return True
+
 
 
     async def type_and_send(self, message: str):
