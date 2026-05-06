@@ -680,7 +680,7 @@ class ChatPage:
     # ═══════════════════════════════════════════════════════════════
     async def upload_file_and_send(self, file_path: str, trigger_text: str) -> bool:
         """
-        上传文件 + 输入触发语 + 按回车发送。
+        上传文件 + 输入触发语 + 点击发送按钮。
         返回 True 表示成功发送，False 表示上传失败。
         """
         # ── 第1步：通过 input[type=file] 设置文件 ──
@@ -689,7 +689,6 @@ class ChatPage:
             file_input = self.page.locator('input[type="file"]')
             count = await file_input.count()
             if count > 0:
-                # 可能有多个 input[type=file]，逐个尝试
                 for i in range(count):
                     try:
                         await file_input.nth(i).set_input_files(file_path)
@@ -701,13 +700,10 @@ class ChatPage:
             print(f"  ⚠️ P#{self.page_id} set_input_files 失败: {e}")
 
         if not uploaded:
-            # 兜底：通过 expect_file_chooser
             try:
                 async with self.page.expect_file_chooser(timeout=5000) as fc_info:
-                    # 点击附件按钮（回形针图标）
                     await self.page.evaluate("""
                         () => {
-                            // 找 textarea 区域附近的上传按钮
                             const textarea = document.querySelector('textarea');
                             if (!textarea) return;
                             let container = textarea;
@@ -717,10 +713,7 @@ class ChatPage:
                             const btns = container.querySelectorAll('div.ds-icon-button');
                             for (const btn of btns) {
                                 const svg = btn.querySelector('svg');
-                                if (svg) {
-                                    btn.click();
-                                    return;
-                                }
+                                if (svg) { btn.click(); return; }
                             }
                         }
                     """)
@@ -733,9 +726,8 @@ class ChatPage:
         if not uploaded:
             return False
 
-        # ── 第2步：等待文件附件出现在输入区域 ──
-        attach_ok = False
-        for _ in range(20):  # 最多等 10 秒
+        # ── 第2步：等待文件附件出现 ──
+        for _ in range(20):
             await asyncio.sleep(0.5)
             try:
                 check = await asyncio.wait_for(
@@ -743,21 +735,19 @@ class ChatPage:
                     timeout=5
                 )
                 if check.get("attached"):
-                    attach_ok = True
                     break
             except Exception:
                 continue
 
-        if not attach_ok:
-            print(f"  ⚠️ P#{self.page_id} 文件上传后未检测到附件预览，仍尝试发送")
-
-        # ── 第3步：在 textarea 输入触发语并发送 ──
+        # ── 第3步：在 textarea 输入触发语 ──
         await asyncio.sleep(0.3)
         textarea = self.page.locator("textarea").first
         try:
             await textarea.wait_for(state="visible", timeout=5000)
             await textarea.click()
             await asyncio.sleep(0.2)
+            await textarea.fill("")
+            await asyncio.sleep(0.1)
             await textarea.fill(trigger_text)
         except Exception:
             try:
@@ -775,19 +765,145 @@ class ChatPage:
             except Exception as e2:
                 print(f"  ⚠️ P#{self.page_id} 输入触发语失败: {e2}")
 
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
 
-        # 按回车发送
+        # ── 第4步：发送！多种方式确保一定能发出去 ──
+        sent = False
+
+        # 方式1：点击发送按钮（蓝色圆形箭头按钮）
         try:
-            await textarea.press("Enter")
-        except Exception:
+            click_result = await self.page.evaluate("""
+                () => {
+                    // 找所有可能的发送按钮
+                    // DeepSeek 的发送按钮通常是 textarea 附近的一个带 svg 的圆形按钮
+                    const textarea = document.querySelector('textarea');
+                    if (!textarea) return 'no-textarea';
+
+                    // 向上找到输入区域的容器
+                    let container = textarea.parentElement;
+                    for (let i = 0; i < 6; i++) {
+                        if (container && container.parentElement) {
+                            container = container.parentElement;
+                        }
+                    }
+                    if (!container) container = document.body;
+
+                    // 策略A：找 role="button" 或 button 标签，且在 textarea 附近
+                    const buttons = container.querySelectorAll(
+                        'button, div[role="button"], span[role="button"]'
+                    );
+                    for (const btn of buttons) {
+                        const rect = btn.getBoundingClientRect();
+                        // 发送按钮通常比较小（圆形）且在右侧
+                        if (rect.width > 20 && rect.width < 60 && rect.height > 20 && rect.height < 60) {
+                            const svg = btn.querySelector('svg');
+                            if (svg) {
+                                btn.click();
+                                return 'clicked-button-svg';
+                            }
+                        }
+                    }
+
+                    // 策略B：找 ds-icon-button 中带发送图标的（通常在最右边）
+                    const iconBtns = container.querySelectorAll('div.ds-icon-button');
+                    if (iconBtns.length > 0) {
+                        // 发送按钮通常是最后一个或者有特定背景色的
+                        for (const btn of iconBtns) {
+                            const style = window.getComputedStyle(btn);
+                            const bg = style.backgroundColor;
+                            // 蓝色/紫色背景的就是发送按钮
+                            if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && bg !== 'rgb(255, 255, 255)') {
+                                btn.click();
+                                return 'clicked-icon-colored:' + bg;
+                            }
+                        }
+                        // 如果都没有彩色背景，点最后一个带 svg 的
+                        const lastBtn = iconBtns[iconBtns.length - 1];
+                        if (lastBtn.querySelector('svg')) {
+                            lastBtn.click();
+                            return 'clicked-icon-last';
+                        }
+                    }
+
+                    // 策略C：找所有 svg 中包含发送图标路径的按钮
+                    const allSvgBtns = container.querySelectorAll('div.ds-icon-button, button');
+                    for (const btn of allSvgBtns) {
+                        const paths = btn.querySelectorAll('svg path');
+                        for (const path of paths) {
+                            const d = (path.getAttribute('d') || '');
+                            // 发送图标的 path 通常包含箭头形状
+                            if (d.includes('M') && d.includes('L') && d.length > 20 && d.length < 200) {
+                                // 检查是否在 textarea 的右侧区域
+                                const btnRect = btn.getBoundingClientRect();
+                                const taRect = textarea.getBoundingClientRect();
+                                if (btnRect.left > taRect.left + taRect.width * 0.5) {
+                                    btn.click();
+                                    return 'clicked-svg-right';
+                                }
+                            }
+                        }
+                    }
+
+                    // 策略D：最暴力 - 找 textarea 同行右侧区域所有可点击元素
+                    const taRect = textarea.getBoundingClientRect();
+                    const allEls = document.elementsFromPoint(
+                        taRect.right + 30,
+                        taRect.top + taRect.height / 2
+                    );
+                    for (const el of allEls) {
+                        if (el.tagName === 'TEXTAREA' || el.tagName === 'HTML' || el.tagName === 'BODY') continue;
+                        if (el.querySelector && el.querySelector('svg')) {
+                            el.click();
+                            return 'clicked-point';
+                        }
+                    }
+
+                    return 'not-found';
+                }
+            """)
+            print(f"  P#{self.page_id} 发送按钮点击结果: {click_result}")
+            if click_result and 'clicked' in click_result:
+                sent = True
+        except Exception as e:
+            print(f"  ⚠️ P#{self.page_id} 点击发送按钮失败: {e}")
+
+        # 方式2：如果按钮没点到，试 Enter 键
+        if not sent:
             try:
+                await textarea.click()
+                await asyncio.sleep(0.1)
                 await self.page.keyboard.press("Enter")
+                print(f"  P#{self.page_id} 使用 keyboard.press Enter")
+                sent = True
+            except Exception as e:
+                print(f"  ⚠️ P#{self.page_id} keyboard Enter 失败: {e}")
+
+        # 方式3：最后兜底 - 模拟键盘事件
+        if not sent:
+            try:
+                await self.page.evaluate("""
+                    () => {
+                        const textarea = document.querySelector('textarea');
+                        if (!textarea) return;
+                        textarea.focus();
+                        const enterEvent = new KeyboardEvent('keydown', {
+                            key: 'Enter',
+                            code: 'Enter',
+                            keyCode: 13,
+                            which: 13,
+                            bubbles: true,
+                            cancelable: true
+                        });
+                        textarea.dispatchEvent(enterEvent);
+                    }
+                """)
+                print(f"  P#{self.page_id} 使用 dispatchEvent Enter")
             except Exception:
                 pass
 
         await asyncio.sleep(0.5)
         return True
+
 
     async def type_and_send(self, message: str):
         """原版：直接在 textarea 输入文字并发送"""
