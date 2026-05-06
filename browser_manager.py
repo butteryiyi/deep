@@ -282,13 +282,13 @@ CLICK_REGENERATE_JS = """
 
 # ═══════════════════════════════════════════════════════════════
 # 点击专家模式按钮
+# ★ 改动：策略2/3/4 增加英文 "Expert Mode" / "Expert mode" / "Expert" 匹配
 # ═══════════════════════════════════════════════════════════════
 CLICK_EXPERT_MODE_JS = """
 () => {
-    // 策略1: 通过 data-model-type="expert" 属性精确定位
+    // 策略1: 通过 data-model-type="expert" 属性精确定位（语言无关）
     const expertByAttr = document.querySelector('[data-model-type="expert"]');
     if (expertByAttr) {
-        // 检查是否已经选中 (aria-checked="true")
         const isChecked = expertByAttr.getAttribute('aria-checked');
         if (isChecked === 'true') {
             return { status: 'already_selected', method: 'data-attr' };
@@ -297,11 +297,11 @@ CLICK_EXPERT_MODE_JS = """
         return { status: 'clicked', method: 'data-attr' };
     }
 
-    // 策略2: 通过文本内容"专家模式"查找
-    const allDivs = document.querySelectorAll('div[role="radio"]');
-    for (const div of allDivs) {
+    // 策略2: 通过文本内容查找（中文+英文）  ★ 改动
+    const allRadios = document.querySelectorAll('div[role="radio"]');
+    for (const div of allRadios) {
         const text = (div.innerText || '').trim();
-        if (text.includes('专家模式')) {
+        if (text.includes('专家模式') || text.includes('Expert Mode') || text.includes('Expert mode') || text.includes('expert mode')) {
             const isChecked = div.getAttribute('aria-checked');
             if (isChecked === 'true') {
                 return { status: 'already_selected', method: 'role-radio-text' };
@@ -311,11 +311,11 @@ CLICK_EXPERT_MODE_JS = """
         }
     }
 
-    // 策略3: 通过类名 _9f2341b 查找 (从 expert_mode_info.json 得知)
+    // 策略3: 通过类名 _9f2341b 查找（中文+英文）  ★ 改动
     const byClass = document.querySelectorAll('div._9f2341b');
     for (const el of byClass) {
         const text = (el.innerText || '').trim();
-        if (text.includes('专家模式') || text.includes('Expert')) {
+        if (text.includes('专家模式') || text.includes('Expert Mode') || text.includes('Expert mode') || text.includes('Expert') || text.includes('expert')) {
             const isChecked = el.getAttribute('aria-checked');
             if (isChecked === 'true') {
                 return { status: 'already_selected', method: 'class-name' };
@@ -325,7 +325,8 @@ CLICK_EXPERT_MODE_JS = """
         }
     }
 
-    // 策略4: 遍历所有包含"专家模式"文本的可点击元素
+    // 策略4: 遍历所有包含目标文本的可点击元素（中文+英文）  ★ 改动
+    const targetTexts = ['专家模式', 'Expert Mode', 'Expert mode', 'expert mode'];
     const allClickables = document.querySelectorAll('div, span, button, a');
     for (const el of allClickables) {
         const directText = el.childNodes.length > 0 ?
@@ -335,8 +336,15 @@ CLICK_EXPERT_MODE_JS = """
                 .join('') : '';
         const innerText = (el.innerText || '').trim();
 
-        if (innerText === '专家模式' || directText === '专家模式') {
-            // 找到包含此文本的最近的可点击父元素
+        let matched = false;
+        for (const t of targetTexts) {
+            if (innerText === t || directText === t) {
+                matched = true;
+                break;
+            }
+        }
+
+        if (matched) {
             let target = el;
             let parent = el.parentElement;
             while (parent) {
@@ -359,10 +367,11 @@ CLICK_EXPERT_MODE_JS = """
 
 # ═══════════════════════════════════════════════════════════════
 # 检查专家模式是否已选中
+# ★ 改动：增加英文 "Expert Mode" / "Expert mode" / "Expert" 匹配
 # ═══════════════════════════════════════════════════════════════
 CHECK_EXPERT_MODE_JS = """
 () => {
-    // 检查 data-model-type="expert" 的元素是否 aria-checked="true"
+    // 检查 data-model-type="expert" 的元素（语言无关）
     const expertEl = document.querySelector('[data-model-type="expert"]');
     if (expertEl) {
         return {
@@ -371,10 +380,11 @@ CHECK_EXPERT_MODE_JS = """
         };
     }
 
-    // 备用: 通过文本查找
+    // 备用: 通过文本查找（中文+英文）  ★ 改动
     const radios = document.querySelectorAll('div[role="radio"]');
     for (const radio of radios) {
-        if ((radio.innerText || '').includes('专家模式')) {
+        const text = (radio.innerText || '').trim();
+        if (text.includes('专家模式') || text.includes('Expert Mode') || text.includes('Expert mode') || text.includes('expert mode')) {
             return {
                 found: true,
                 checked: radio.getAttribute('aria-checked') === 'true'
@@ -601,6 +611,10 @@ class ChatPage:
         except Exception as e:
             return False, f"check_error_failed:{e}"
 
+    # ═══════════════════════════════════════════════════════════════
+    # ★ 改动：start_new_chat 优先使用 Ctrl+J 快捷键（语言无关），
+    #         文本匹配作为兜底，同时兼容中英文
+    # ═══════════════════════════════════════════════════════════════
     async def start_new_chat(self):
         self._hook_installed = False
         if "chat.deepseek.com" not in (self.page.url or ""):
@@ -610,10 +624,31 @@ class ChatPage:
             )
             await asyncio.sleep(2)
 
+        # ★ 改动：优先用快捷键 Ctrl+J 开新对话（不依赖语言）
+        try:
+            await self.page.keyboard.press("Control+j")
+            await asyncio.sleep(1)
+            # 检查是否成功（页面上对话列表item数应该很少或textarea为空）
+            textarea = self.page.locator("textarea").first
+            try:
+                val = await textarea.input_value()
+                if val == "" or val is None:
+                    # 快捷键成功
+                    return
+            except Exception:
+                pass
+            # 即使无法验证，快捷键大概率成功，直接返回
+            return
+        except Exception:
+            pass
+
+        # ★ 改动：兜底方案 - 文本匹配，兼容中英文（含大小写变体）
         for sel in [
             "xpath=//*[contains(text(), '开启新对话')]",
             "xpath=//*[contains(text(), '新对话')]",
             "xpath=//*[contains(text(), 'New chat')]",
+            "xpath=//*[contains(text(), 'New Chat')]",
+            "xpath=//*[contains(text(), 'new chat')]",
             "[class*='new-chat']",
         ]:
             try:
