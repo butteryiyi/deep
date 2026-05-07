@@ -12,6 +12,7 @@ import json
 import asyncio
 import base64
 import shutil
+import uuid
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -1172,9 +1173,14 @@ class BrowserManager:
             print(f"  ❌ 页面#{cp.page_id} 恢复失败: {e}")
 
     def _write_upload_file(self, content: str) -> str:
-        with open(_UPLOAD_TMP_PATH, "w", encoding="utf-8") as f:
+        unique_path = os.path.join(
+            tempfile.gettempdir(),
+            f"ds_upload_prompt_{uuid.uuid4().hex[:8]}.txt"
+        )
+        with open(unique_path, "w", encoding="utf-8") as f:
             f.write(content)
-        return _UPLOAD_TMP_PATH
+        return unique_path
+
 
     async def send_message(self, message: str) -> str:
         full = ""
@@ -1297,6 +1303,13 @@ class BrowserManager:
         await asyncio.sleep(0.3)
 
         file_path = self._write_upload_file(message)
+        try:
+            upload_ok = await cp.upload_file_and_send(file_path, self._upload_trigger_text)
+        finally:
+            try:
+                os.unlink(file_path)
+            except OSError:
+                pass
         print(f"  [#{req_id}] 📎 消息({len(message)}字符)，走文件上传模式")
 
         upload_ok = await cp.upload_file_and_send(file_path, self._upload_trigger_text)
