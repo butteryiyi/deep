@@ -1310,14 +1310,13 @@ class BrowserManager:
                 os.unlink(file_path)
             except OSError:
                 pass
+
         print(f"  [#{req_id}] 📎 消息({len(message)}字符)，走文件上传模式")
 
-        upload_ok = await cp.upload_file_and_send(file_path, self._upload_trigger_text)
-
-        if not upload_ok:
-            print(f"  [#{req_id}] ⚠️ 文件上传失败，回退直接输入")
-            truncated = message[:8000] if len(message) > 8000 else message
-            await cp.type_and_send(truncated)
+if not upload_ok:
+    print(f"  [#{req_id}] ⚠️ 文件上传失败，回退直接输入")
+    truncated = message[:8000] if len(message) > 8000 else message
+    await cp.type_and_send(truncated)
 
         retry_tag = f" (重试#{retry_num})" if retry_num > 0 else ""
         print(f"  [#{req_id}] 已发送{retry_tag}")
