@@ -646,10 +646,10 @@ class ChatPage:
         )
         await asyncio.sleep(3)
 
-    async def _check_message_sent(self) -> bool:
+    async def _check_message_sent(self, initial_item_count: int = 0) -> bool:
         try:
             state = await self.read_state()
-            return state.get("itemCount", 0) >= 1
+            return state.get("itemCount", 0) > initial_item_count
         except Exception:
             return False
 
