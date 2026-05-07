@@ -1361,6 +1361,8 @@ class BrowserManager:
 
             if scroll_counter % 12 == 0:
                 await cp.scroll_to_bottom()
+            if scroll_counter % 8 == 0:
+                await cp._activate_page()
 
             state = await cp.read_state()
             dom_text = state.get("domText", "")
@@ -1776,6 +1778,10 @@ class BrowserManager:
         for cp in self._pages:
             try:
                 if cp.page.is_closed() or cp.busy:
+                    continue
+                if cp.busy:
+                    if self.heartbeat_count % 2 == 0:
+                        await cp._activate_page()
                     continue
 
                 await cp.page.mouse.move(
