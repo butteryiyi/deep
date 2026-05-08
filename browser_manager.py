@@ -1222,88 +1222,88 @@ class BrowserManager:
         done_event = asyncio.Event()
         holder = {"text": None, "error_type": None}
 
-    async def _background_work():
-        try:
-            max_full_retries = 2
+        async def _background_work():
+            try:
+                max_full_retries = 2
 
-            for full_attempt in range(max_full_retries + 1):
-                cp = None
-                try:
+                for full_attempt in range(max_full_retries + 1):
+                    cp = None
                     try:
-                        cp = await asyncio.wait_for(self._acquire_page(), timeout=120)
-                    except asyncio.TimeoutError:
-                        holder["text"] = "[错误] 所有页面繁忙，等待超时，请稍后重试"
-                        holder["error_type"] = "page_timeout"
-                        return
-                    except RuntimeError as e:
+                        try:
+                            cp = await asyncio.wait_for(self._acquire_page(), timeout=120)
+                        except asyncio.TimeoutError:
+                            holder["text"] = "[错误] 所有页面繁忙，等待超时，请稍后重试"
+                            holder["error_type"] = "page_timeout"
+                            return
+                        except RuntimeError as e:
+                            holder["text"] = f"[错误] {e}"
+                            holder["error_type"] = "exception"
+                            return
+
+                        print(f"  [#{req_id}] → 页面#{cp.page_id} (完整尝试 {full_attempt + 1}/{max_full_retries + 1})")
+
+                        max_retries = 2
+                        success = False
+                        for attempt in range(max_retries + 1):
+                            text, err = await self._do_send_and_wait(
+                                cp, message, req_id, attempt
+                            )
+
+                            if err == "server_error" and attempt < max_retries:
+                                wait_time = 5 * (attempt + 1)
+                                print(f"  [#{req_id}] 🔄 服务器错误，{wait_time}s 后重试 "
+                                      f"({attempt + 1}/{max_retries})...")
+                                await asyncio.sleep(wait_time)
+                                await self._recover_page(cp)
+                                continue
+
+                            holder["text"] = text
+                            holder["error_type"] = err
+                            if err is None:
+                                self._consecutive_errors = 0
+                                success = True
+                            elif err == "server_error":
+                                self._consecutive_errors += 1
+                                self._last_error_time = time.time()
+                            break
+
+                        if success:
+                            return
+
+                        if full_attempt < max_full_retries:
+                            print(f"  [#{req_id}] ⚠️ 页面#{cp.page_id}所有重试均失败，"
+                                  f"释放页面，当作新请求换页面重试...")
+                            await self._recover_page(cp)
+                            self._release_page(cp)
+                            cp = None
+                            wait_before_retry = 8 * (full_attempt + 1)
+                            print(f"  [#{req_id}] ⏳ 等待 {wait_before_retry}s 后换页面重试...")
+                            await asyncio.sleep(wait_before_retry)
+                            holder["text"] = None
+                            holder["error_type"] = None
+                            continue
+                        else:
+                            if holder["text"] is None or holder["error_type"] == "server_error":
+                                holder["text"] = "[错误] 服务器繁忙，所有页面多次重试后仍失败，请稍后重试。"
+                            return
+
+                    except Exception as e:
+                        print(f"  [#{req_id}] ❌ 后台任务异常: {e}")
+                        import traceback
+                        traceback.print_exc()
                         holder["text"] = f"[错误] {e}"
                         holder["error_type"] = "exception"
                         return
+                    finally:
+                        if cp:
+                            self._release_page(cp)
 
-                    print(f"  [#{req_id}] → 页面#{cp.page_id} (完整尝试 {full_attempt + 1}/{max_full_retries + 1})")
+                if holder["text"] is None:
+                    holder["text"] = "[错误] 所有尝试均失败，请稍后重试。"
+                    holder["error_type"] = "all_failed"
+            finally:
+                done_event.set()
 
-                    max_retries = 2
-                    success = False
-                    for attempt in range(max_retries + 1):
-                        text, err = await self._do_send_and_wait(
-                            cp, message, req_id, attempt
-                        )
-
-                        if err == "server_error" and attempt < max_retries:
-                            wait_time = 5 * (attempt + 1)
-                            print(f"  [#{req_id}] 🔄 服务器错误，{wait_time}s 后重试 "
-                                  f"({attempt + 1}/{max_retries})...")
-                            await asyncio.sleep(wait_time)
-                            await self._recover_page(cp)
-                            continue
-
-                        holder["text"] = text
-                        holder["error_type"] = err
-                        if err is None:
-                            self._consecutive_errors = 0
-                            success = True
-                        elif err == "server_error":
-                            self._consecutive_errors += 1
-                            self._last_error_time = time.time()
-                        break
-
-                    if success:
-                        return
-
-                    if full_attempt < max_full_retries:
-                        print(f"  [#{req_id}] ⚠️ 页面#{cp.page_id}所有重试均失败，"
-                              f"释放页面，当作新请求换页面重试...")
-                        await self._recover_page(cp)
-                        self._release_page(cp)
-                        cp = None
-                        wait_before_retry = 8 * (full_attempt + 1)
-                        print(f"  [#{req_id}] ⏳ 等待 {wait_before_retry}s 后换页面重试...")
-                        await asyncio.sleep(wait_before_retry)
-                        holder["text"] = None
-                        holder["error_type"] = None
-                        continue
-                    else:
-                        if holder["text"] is None or holder["error_type"] == "server_error":
-                            holder["text"] = "[错误] 服务器繁忙，所有页面多次重试后仍失败，请稍后重试。"
-                        return
-
-                except Exception as e:
-                    print(f"  [#{req_id}] ❌ 后台任务异常: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    holder["text"] = f"[错误] {e}"
-                    holder["error_type"] = "exception"
-                    return
-                finally:
-                    if cp:
-                        self._release_page(cp)
-
-            if holder["text"] is None:
-                holder["text"] = "[错误] 所有尝试均失败，请稍后重试。"
-                holder["error_type"] = "all_failed"
-        finally:
-            done_event.set()
-            
         task = asyncio.create_task(_background_work())
 
         heartbeat_interval = 3.0
@@ -1325,6 +1325,7 @@ class BrowserManager:
             yield final_text
         else:
             yield "抱歉，未能获取到响应。请稍后重试。"
+
 
     async def _do_send_and_wait(
         self, cp: ChatPage, message: str, req_id: int, retry_num: int
