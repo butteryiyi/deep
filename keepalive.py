@@ -164,13 +164,13 @@ class KeepaliveService:
         """
         try:
             if not hasattr(self.browser_mgr, 'context_pages') or \
-               not self.browser_mgr.context_pages:
+               not self.browser_mgr._pages:
                 return
 
             now = time.time()
             current_busy_ids = set()
 
-            for cp in self.browser_mgr.context_pages:
+            for cp in self.browser_mgr._pages:
                 page_id = id(cp)
                 page_id_str = str(page_id)
 
@@ -220,7 +220,7 @@ class KeepaliveService:
 
             # 清理已不存在的页面记录（页面被销毁或替换的情况）
             stale_ids = set(self._page_busy_since.keys()) - current_busy_ids - \
-                        {str(id(cp)) for cp in self.browser_mgr.context_pages if not cp.busy}
+                        {str(id(cp)) for cp in self.browser_mgr._pages if not cp.busy}
             for stale_id in stale_ids:
                 self._page_busy_since.pop(stale_id, None)
                 self._page_rescue_count.pop(stale_id, None)
