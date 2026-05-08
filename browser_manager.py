@@ -895,7 +895,6 @@ class ChatPage:
 
         # ── 第6步：如果所有策略都失败，定期激活页面+按Enter重试直到发出去 ──
         if not sent:
-        if not sent:
             print(f"  ⚠️ P#{self.page_id} 所有发送策略均未确认成功，开始定期激活页面+按Enter重试...")
             max_enter_retries = 15
             for retry_i in range(max_enter_retries):
@@ -1223,7 +1222,8 @@ class BrowserManager:
         done_event = asyncio.Event()
         holder = {"text": None, "error_type": None}
 
-        async def _background_work():
+    async def _background_work():
+        try:
             max_full_retries = 2
 
             for full_attempt in range(max_full_retries + 1):
@@ -1301,8 +1301,9 @@ class BrowserManager:
             if holder["text"] is None:
                 holder["text"] = "[错误] 所有尝试均失败，请稍后重试。"
                 holder["error_type"] = "all_failed"
-
-
+        finally:
+            done_event.set()
+            
         task = asyncio.create_task(_background_work())
 
         heartbeat_interval = 3.0
