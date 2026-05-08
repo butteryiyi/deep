@@ -656,9 +656,19 @@ class ChatPage:
     async def _activate_page(self):
         """强制激活页面渲染管线，防止浏览器节流导致事件丢失"""
         try:
+            # 完整截图才能真正唤醒页面（1x1像素不够）
             await self.page.screenshot(
-                clip={"x": 0, "y": 0, "width": 1, "height": 1},
-                timeout=5000,
+                full_page=False,
+                timeout=10000,
+            )
+            return
+        except Exception:
+            pass
+        try:
+            # 退而求其次：小截图
+            await self.page.screenshot(
+                clip={"x": 0, "y": 0, "width": 100, "height": 100},
+                timeout=8000,
             )
             return
         except Exception:
@@ -666,10 +676,13 @@ class ChatPage:
         try:
             await self.page.evaluate(
                 "() => { document.hidden; window.innerHeight; "
-                "document.querySelectorAll('*').length; }"
+                "document.querySelectorAll('*').length; "
+                "window.dispatchEvent(new Event('focus')); "
+                "document.dispatchEvent(new Event('visibilitychange')); }"
             )
         except Exception:
             pass
+
 
     async def upload_file_and_send(self, file_path: str, trigger_text: str) -> bool:
         uploaded = False
@@ -787,7 +800,9 @@ class ChatPage:
 
         # ── 发送前强制激活页面，防止浏览器节流吞掉按键事件 ──
         await self._activate_page()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(1.0)
+        await self._activate_page()
+        await asyncio.sleep(0.5)
 
         # ── 第5步：多重发送策略 ──
         sent = False
@@ -880,12 +895,16 @@ class ChatPage:
 
         # ── 第6步：如果所有策略都失败，定期激活页面+按Enter重试直到发出去 ──
         if not sent:
+        if not sent:
             print(f"  ⚠️ P#{self.page_id} 所有发送策略均未确认成功，开始定期激活页面+按Enter重试...")
-            max_enter_retries = 30
+            max_enter_retries = 15
             for retry_i in range(max_enter_retries):
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(3.0)
+                # 每次重试前做完整截图唤醒
                 await self._activate_page()
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(1.5)
+                await self._activate_page()
+                await asyncio.sleep(0.5)
                 try:
                     await textarea.click()
                     await asyncio.sleep(0.2)
@@ -1205,57 +1224,84 @@ class BrowserManager:
         holder = {"text": None, "error_type": None}
 
         async def _background_work():
-            cp = None
-            try:
+            max_full_retries = 2
+
+            for full_attempt in range(max_full_retries + 1):
+                cp = None
                 try:
-                    cp = await asyncio.wait_for(self._acquire_page(), timeout=120)
-                except asyncio.TimeoutError:
-                    holder["text"] = "[错误] 所有页面繁忙，等待超时，请稍后重试"
-                    holder["error_type"] = "page_timeout"
-                    return
-                except RuntimeError as e:
+                    try:
+                        cp = await asyncio.wait_for(self._acquire_page(), timeout=120)
+                    except asyncio.TimeoutError:
+                        holder["text"] = "[错误] 所有页面繁忙，等待超时，请稍后重试"
+                        holder["error_type"] = "page_timeout"
+                        return
+                    except RuntimeError as e:
+                        holder["text"] = f"[错误] {e}"
+                        holder["error_type"] = "exception"
+                        return
+
+                    print(f"  [#{req_id}] → 页面#{cp.page_id} (完整尝试 {full_attempt + 1}/{max_full_retries + 1})")
+
+                    max_retries = 2
+                    success = False
+                    for attempt in range(max_retries + 1):
+                        text, err = await self._do_send_and_wait(
+                            cp, message, req_id, attempt
+                        )
+
+                        if err == "server_error" and attempt < max_retries:
+                            wait_time = 5 * (attempt + 1)
+                            print(f"  [#{req_id}] 🔄 服务器错误，{wait_time}s 后重试 "
+                                  f"({attempt + 1}/{max_retries})...")
+                            await asyncio.sleep(wait_time)
+                            await self._recover_page(cp)
+                            continue
+
+                        holder["text"] = text
+                        holder["error_type"] = err
+                        if err is None:
+                            self._consecutive_errors = 0
+                            success = True
+                        elif err == "server_error":
+                            self._consecutive_errors += 1
+                            self._last_error_time = time.time()
+                        break
+
+                    if success:
+                        return
+
+                    if full_attempt < max_full_retries:
+                        print(f"  [#{req_id}] ⚠️ 页面#{cp.page_id}所有重试均失败，"
+                              f"释放页面，当作新请求换页面重试...")
+                        await self._recover_page(cp)
+                        self._release_page(cp)
+                        cp = None
+                        wait_before_retry = 8 * (full_attempt + 1)
+                        print(f"  [#{req_id}] ⏳ 等待 {wait_before_retry}s 后换页面重试...")
+                        await asyncio.sleep(wait_before_retry)
+                        holder["text"] = None
+                        holder["error_type"] = None
+                        continue
+                    else:
+                        if holder["text"] is None or holder["error_type"] == "server_error":
+                            holder["text"] = "[错误] 服务器繁忙，所有页面多次重试后仍失败，请稍后重试。"
+                        return
+
+                except Exception as e:
+                    print(f"  [#{req_id}] ❌ 后台任务异常: {e}")
+                    import traceback
+                    traceback.print_exc()
                     holder["text"] = f"[错误] {e}"
                     holder["error_type"] = "exception"
                     return
+                finally:
+                    if cp:
+                        self._release_page(cp)
 
-                print(f"  [#{req_id}] → 页面#{cp.page_id}")
+            if holder["text"] is None:
+                holder["text"] = "[错误] 所有尝试均失败，请稍后重试。"
+                holder["error_type"] = "all_failed"
 
-                max_retries = 2
-                for attempt in range(max_retries + 1):
-                    text, err = await self._do_send_and_wait(
-                        cp, message, req_id, attempt
-                    )
-
-                    if err == "server_error" and attempt < max_retries:
-                        wait_time = 5 * (attempt + 1)
-                        print(f"  [#{req_id}] 🔄 服务器错误，{wait_time}s 后重试 "
-                              f"({attempt + 1}/{max_retries})...")
-                        await asyncio.sleep(wait_time)
-                        await self._recover_page(cp)
-                        continue
-
-                    holder["text"] = text
-                    holder["error_type"] = err
-                    if err is None:
-                        self._consecutive_errors = 0
-                    elif err == "server_error":
-                        self._consecutive_errors += 1
-                        self._last_error_time = time.time()
-                    break
-
-                if holder["text"] is None and holder["error_type"] == "server_error":
-                    holder["text"] = "[错误] 服务器繁忙，多次重试后仍然失败，请稍后重试。"
-
-            except Exception as e:
-                print(f"  [#{req_id}] ❌ 后台任务异常: {e}")
-                import traceback
-                traceback.print_exc()
-                holder["text"] = f"[错误] {e}"
-                holder["error_type"] = "exception"
-            finally:
-                if cp:
-                    self._release_page(cp)
-                done_event.set()
 
         task = asyncio.create_task(_background_work())
 
@@ -1283,6 +1329,8 @@ class BrowserManager:
         self, cp: ChatPage, message: str, req_id: int, retry_num: int
     ) -> tuple:
         cp.request_count += 1
+        await cp._activate_page()
+        await asyncio.sleep(0.5)
 
         if not await cp.is_alive():
             print(f"  [#{req_id}] 页面死亡，恢复中...")
