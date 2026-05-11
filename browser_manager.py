@@ -1748,12 +1748,30 @@ class BrowserManager:
                     pass
 
     async def refresh_idle_pages(self) -> int:
+        """刷新所有空闲页面，如果页面已死则尝试重建"""
         refreshed = 0
-        for cp in self._pages:
+        for i, cp in enumerate(self._pages):
             if cp.busy:
                 continue
             try:
+                # 先检查页面是否还活着
                 if cp.page.is_closed():
+                    # 页面已关闭，尝试重建
+                    print(f"  🔄 页面#{cp.page_id} 已关闭，尝试重建...")
+                    try:
+                        new_page = await self.context.new_page()
+                        await new_page.goto(
+                            "https://chat.deepseek.com/",
+                            wait_until="domcontentloaded", timeout=30000,
+                        )
+                        await asyncio.sleep(2)
+                        cp.page = new_page
+                        cp._hook_installed = False
+                        await cp.ensure_clipboard_hook()
+                        refreshed += 1
+                        print(f"  ✅ 页面#{cp.page_id} 已重建")
+                    except Exception as e:
+                        print(f"  ❌ 页面#{cp.page_id} 重建失败: {e}")
                     continue
 
                 current_url = cp.page.url or ""
@@ -1770,9 +1788,15 @@ class BrowserManager:
                 cp._hook_installed = False
                 await cp.ensure_clipboard_hook()
                 refreshed += 1
+
             except Exception as e:
+                err_msg = str(e)
                 print(f"  ⚠️ 刷新页面#{cp.page_id} 失败: {e}")
+                # 如果是 browser/context 已关闭，标记以便上层处理
+                if "has been closed" in err_msg or "Target closed" in err_msg:
+                    print(f"  ❌ 页面#{cp.page_id} 的浏览器上下文已关闭，需要完整重启")
         return refreshed
+
 
     async def is_alive(self) -> bool:
         if not self._ready or not self._pages:
@@ -1827,13 +1851,16 @@ class BrowserManager:
 
         for cp in self._pages:
             try:
-                if cp.page.is_closed() or cp.busy:
+                if cp.page.is_closed():
                     continue
+
+                # 忙碌的页面：只做轻量唤醒，不做鼠标移动等操作
                 if cp.busy:
                     if self.heartbeat_count % 2 == 0:
                         await cp._activate_page()
                     continue
 
+                # 以下是空闲页面的操作
                 await cp.page.mouse.move(
                     random.randint(100, 1800),
                     random.randint(100, 900),
@@ -1889,6 +1916,92 @@ class BrowserManager:
                     pass
             busy = sum(1 for cp in self._pages if cp.busy)
             print(f"💓 #{self.heartbeat_count} ({alive}活/{busy}忙) 登录={self.logged_in}")
+
+        # ═══════════════════════════════════════════════════════════════
+    # 新增：完整重启浏览器（当浏览器进程崩溃时调用）
+    # ═══════════════════════════════════════════════════════════════
+    async def restart(self):
+        """完整重启浏览器，当浏览器进程崩溃后调用"""
+        print("\n🔄 ========== 开始完整重启浏览器 ==========")
+
+        # 1. 标记为未就绪，阻止新请求进入
+        self._ready = False
+        self._ready_event.clear()
+
+        # 2. 清理所有旧页面
+        for cp in self._pages:
+            try:
+                if not cp.page.is_closed():
+                    await cp.page.close()
+            except Exception:
+                pass
+        self._pages.clear()
+
+        # 3. 关闭旧的 context / browser / playwright
+        try:
+            if self.context:
+                await self.context.close()
+        except Exception:
+            pass
+        self.context = None
+
+        try:
+            if self._camoufox_ctx:
+                await self._camoufox_ctx.__aexit__(None, None, None)
+            elif self.browser:
+                await self.browser.close()
+        except Exception:
+            pass
+        self._camoufox_ctx = None
+        self.browser = None
+
+        try:
+            if self.playwright:
+                await self.playwright.stop()
+        except Exception:
+            pass
+        self.playwright = None
+
+        # 4. 重置信号量（防止旧的 semaphore 死锁）
+        self._page_semaphore = None
+
+        # 5. 短暂等待，确保旧进程完全退出
+        await asyncio.sleep(3)
+
+        # 6. 重新初始化
+        try:
+            await self.initialize()
+            print("🔄 ========== 浏览器重启完成 ==========\n")
+            return True
+        except Exception as e:
+            print(f"🔄 ========== 浏览器重启失败: {e} ==========\n")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def is_browser_connected(self) -> bool:
+        """检查浏览器进程本身是否还活着（比 is_alive 更底层）"""
+        try:
+            if self.browser is None:
+                return False
+            # 尝试与浏览器进程通信
+            if hasattr(self.browser, 'is_connected'):
+                return self.browser.is_connected()
+            # 退而求其次：尝试在任意页面执行 JS
+            for cp in self._pages:
+                try:
+                    if not cp.page.is_closed():
+                        await asyncio.wait_for(
+                            cp.page.evaluate("() => 1"),
+                            timeout=5
+                        )
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
 
     async def shutdown(self):
         try:
