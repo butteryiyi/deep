@@ -3,7 +3,8 @@
 - 定期模拟用户活动，防止会话过期
 - 定期检查登录状态，失效时自动重新注入 Cookie
 - 定期刷新页面，防止前端 SPA 状态丢失
-- 定期检测长时间忙碌的页面，执行轻量截图唤醒，防止页面陷入冻结
+- 定期检测长时间忙碌的页面，执行轻量截图唤醒
+- 【新增】检测浏览器进程崩溃，自动完整重启
 """
 
 import time
@@ -16,10 +17,10 @@ class KeepaliveService:
         self,
         browser_mgr: BrowserManager,
         interval: int = 30,
-        login_check_interval: int = 180,        # 每 3 分钟检查一次登录状态
-        page_refresh_interval: int = 1800,       # 每 30 分钟强制刷新一次空闲页面
-        busy_page_timeout: int = 180,            # 忙碌超过 3 分钟视为卡死
-        busy_rescue_check_interval: int = 60,    # 每 60 秒检查一次是否有卡死页面
+        login_check_interval: int = 180,
+        page_refresh_interval: int = 1800,
+        busy_page_timeout: int = 180,
+        busy_rescue_check_interval: int = 60,
     ):
         self.browser_mgr = browser_mgr
         self.interval = interval
@@ -36,10 +37,15 @@ class KeepaliveService:
         self._last_busy_rescue_check = 0.0
         self._login_check_failures = 0
 
-        # 记录每个页面进入忙碌状态的时间 {page_id: busy_start_time}
         self._page_busy_since: dict[str, float] = {}
-        # 记录对卡死页面已执行的救援次数 {page_id: count}
         self._page_rescue_count: dict[str, int] = {}
+
+        # ── 新增：浏览器重启相关 ──
+        self._last_restart_attempt = 0.0
+        self._restart_cooldown = 60.0        # 重启冷却时间（秒），失败后递增
+        self._restart_count = 0              # 连续重启次数
+        self._max_restart_count = 10         # 最大连续重启次数
+        self._consecutive_dead_checks = 0    # 连续检测到浏览器死亡的次数
 
     async def start(self):
         if self.is_running:
@@ -75,8 +81,18 @@ class KeepaliveService:
                 if not self._running or not self.browser_mgr:
                     continue
 
+                # ── 关键修复：浏览器死亡时尝试重启，而不是跳过 ──
                 if not await self.browser_mgr.is_alive():
+                    self._consecutive_dead_checks += 1
+                    print(f"💀 浏览器不可用（连续第 {self._consecutive_dead_checks} 次检测）")
+
+                    # 连续 2 次检测到死亡才触发重启（避免偶发性误判）
+                    if self._consecutive_dead_checks >= 2:
+                        await self._try_restart_browser()
                     continue
+
+                # 浏览器活着，重置死亡计数
+                self._consecutive_dead_checks = 0
 
                 # ── 1. 常规模拟活动（每次心跳都做） ──
                 await self.browser_mgr.simulate_activity()
@@ -88,7 +104,7 @@ class KeepaliveService:
                     self._last_login_check = now
                     await self._check_and_fix_login()
 
-                # ── 3. 定期刷新空闲页面（防止前端 SPA 状态腐化） ──
+                # ── 3. 定期刷新空闲页面 ──
                 if now - self._last_page_refresh >= self.page_refresh_interval:
                     self._last_page_refresh = now
                     await self._refresh_idle_pages()
@@ -103,6 +119,68 @@ class KeepaliveService:
             except Exception as e:
                 print(f"⚠️ 心跳循环异常: {e}")
                 await asyncio.sleep(5)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 新增：浏览器完整重启
+    # ═══════════════════════════════════════════════════════════════
+    async def _try_restart_browser(self):
+        """尝试完整重启浏览器"""
+        now = time.time()
+
+        # 检查冷却时间
+        if now - self._last_restart_attempt < self._restart_cooldown:
+            remaining = self._restart_cooldown - (now - self._last_restart_attempt)
+            print(f"  ⏳ 重启冷却中，还需等待 {remaining:.0f}s")
+            return
+
+        # 检查是否超过最大重启次数
+        if self._restart_count >= self._max_restart_count:
+            print(f"  ❌ 已连续重启 {self._restart_count} 次均失败，"
+                  f"停止自动重启，需要人工干预！")
+            # 每 10 分钟重置一次，给一次新的机会
+            if now - self._last_restart_attempt > 600:
+                print(f"  🔄 距上次重启已超过 10 分钟，重置重启计数，再试一次...")
+                self._restart_count = 0
+                self._restart_cooldown = 60.0
+            else:
+                return
+
+        self._last_restart_attempt = now
+        self._restart_count += 1
+
+        print(f"\n🔄 浏览器不可用，尝试第 {self._restart_count} 次完整重启...")
+
+        try:
+            if not hasattr(self.browser_mgr, 'restart'):
+                print("  ❌ BrowserManager 没有 restart() 方法，无法自动重启")
+                return
+
+            success = await self.browser_mgr.restart()
+
+            if success:
+                print(f"  ✅ 浏览器重启成功！")
+                self._restart_count = 0
+                self._restart_cooldown = 60.0
+                self._consecutive_dead_checks = 0
+                # 重置其他计时器
+                now2 = time.time()
+                self._last_login_check = now2
+                self._last_page_refresh = now2
+                self._last_busy_rescue_check = now2
+                self._login_check_failures = 0
+                self._page_busy_since.clear()
+                self._page_rescue_count.clear()
+            else:
+                print(f"  ❌ 浏览器重启失败（第 {self._restart_count} 次）")
+                # 递增冷却时间：60s → 120s → 240s → ... → 最大600s
+                self._restart_cooldown = min(self._restart_cooldown * 2, 600)
+                print(f"  ⏳ 下次重启冷却时间: {self._restart_cooldown:.0f}s")
+
+        except Exception as e:
+            print(f"  ❌ 浏览器重启异常: {e}")
+            import traceback
+            traceback.print_exc()
+            self._restart_cooldown = min(self._restart_cooldown * 2, 600)
 
     async def _check_and_fix_login(self):
         """检查登录状态，如果失效则自动重新登录"""
@@ -119,7 +197,6 @@ class KeepaliveService:
             print(f"⚠️ 检测到登录状态失效 "
                   f"(连续 {self._login_check_failures} 次)")
 
-            # 第一次检测失败：先尝试简单刷新页面
             if self._login_check_failures == 1:
                 print("  🔄 尝试刷新页面恢复...")
                 refreshed = await self.browser_mgr.refresh_idle_pages()
@@ -131,7 +208,6 @@ class KeepaliveService:
                         self._login_check_failures = 0
                         return
 
-            # 第二次及之后：重新注入 Cookie
             print("  🔄 刷新无效，开始重新注入 Cookie...")
             success = await self.browser_mgr.re_login()
             if success:
@@ -141,30 +217,33 @@ class KeepaliveService:
                 print(f"  ❌ 重新登录失败（第 {self._login_check_failures} 次），"
                       f"下次心跳将继续尝试")
 
+                # 如果连续多次重新登录失败，可能需要完整重启
+                if self._login_check_failures >= 5:
+                    print(f"  ⚠️ 连续 {self._login_check_failures} 次登录失败，"
+                          f"尝试完整重启浏览器...")
+                    await self._try_restart_browser()
+
         except Exception as e:
             print(f"⚠️ 登录状态检查异常: {e}")
 
     async def _refresh_idle_pages(self):
-        """定期刷新空闲页面，防止前端状态腐化"""
+        """定期刷新空闲页面"""
         try:
             count = await self.browser_mgr.refresh_idle_pages()
             if count > 0:
                 print(f"💓 已刷新 {count} 个空闲页面")
         except Exception as e:
+            err_msg = str(e)
             print(f"⚠️ 刷新空闲页面异常: {e}")
+            # 如果是浏览器级别的崩溃，标记以便下一轮触发重启
+            if "has been closed" in err_msg or "Target closed" in err_msg:
+                self._consecutive_dead_checks = 2  # 立即触发重启
 
     async def _rescue_stuck_busy_pages(self):
-        """
-        检测长时间处于忙碌状态的页面，执行轻量截图唤醒。
-        
-        策略：
-        - 页面忙碌超过 busy_page_timeout（默认3分钟）→ 执行轻量截图
-        - 截图不会中断正在进行的对话，只是触发浏览器渲染管线
-        - 如果同一页面被反复救援超过 3 次，说明可能真的卡死，打印警告
-        """
+        """检测长时间处于忙碌状态的页面，执行轻量截图唤醒"""
         try:
-            if not hasattr(self.browser_mgr, 'context_pages') or \
-               not self.browser_mgr._pages:
+            # ── 修复：使用正确的属性名 _pages（而非 context_pages） ──
+            if not self.browser_mgr._pages:
                 return
 
             now = time.time()
@@ -177,25 +256,22 @@ class KeepaliveService:
                 if cp.busy:
                     current_busy_ids.add(page_id_str)
 
-                    # 第一次发现该页面处于忙碌状态，记录起始时间
                     if page_id_str not in self._page_busy_since:
                         self._page_busy_since[page_id_str] = now
                         continue
 
                     busy_duration = now - self._page_busy_since[page_id_str]
 
-                    # 忙碌时间未超过阈值，跳过
                     if busy_duration < self.busy_page_timeout:
                         continue
 
-                    # ── 超时！执行轻量截图唤醒 ──
                     rescue_count = self._page_rescue_count.get(page_id_str, 0)
                     rescue_count += 1
                     self._page_rescue_count[page_id_str] = rescue_count
 
-                    print(f"🚑 检测到页面已忙碌 {busy_duration:.0f}s（超过 "
-                          f"{self.busy_page_timeout}s），执行轻量截图唤醒 "
-                          f"（第 {rescue_count} 次救援）")
+                    print(f"🚑 检测到页面#{cp.page_id}已忙碌 {busy_duration:.0f}s"
+                          f"（超过 {self.busy_page_timeout}s），"
+                          f"执行轻量截图唤醒（第 {rescue_count} 次救援）")
 
                     try:
                         await self._lightweight_screenshot(cp)
@@ -203,24 +279,21 @@ class KeepaliveService:
                     except Exception as e:
                         print(f"  ❌ 轻量截图失败: {e}")
 
-                    # 重置忙碌起始时间，避免下一轮立即再次触发
                     self._page_busy_since[page_id_str] = now
 
-                    # 多次救援仍未恢复，发出严重警告
                     if rescue_count >= 3:
-                        print(f"  ⚠️ 该页面已被救援 {rescue_count} 次仍处于忙碌状态，"
-                              f"可能需要人工干预或强制重启")
+                        print(f"  ⚠️ 页面#{cp.page_id}已被救援 {rescue_count} 次"
+                              f"仍处于忙碌状态，可能需要人工干预")
 
                 else:
-                    # 页面不再忙碌，清除跟踪记录
                     if page_id_str in self._page_busy_since:
                         del self._page_busy_since[page_id_str]
                     if page_id_str in self._page_rescue_count:
                         del self._page_rescue_count[page_id_str]
 
-            # 清理已不存在的页面记录（页面被销毁或替换的情况）
-            stale_ids = set(self._page_busy_since.keys()) - current_busy_ids - \
-                        {str(id(cp)) for cp in self.browser_mgr._pages if not cp.busy}
+            # 清理已不存在的页面记录
+            all_page_ids = {str(id(cp)) for cp in self.browser_mgr._pages}
+            stale_ids = set(self._page_busy_since.keys()) - all_page_ids
             for stale_id in stale_ids:
                 self._page_busy_since.pop(stale_id, None)
                 self._page_rescue_count.pop(stale_id, None)
@@ -229,29 +302,20 @@ class KeepaliveService:
             print(f"⚠️ 救援卡死页面异常: {e}")
 
     async def _lightweight_screenshot(self, cp):
-        """
-        对指定的 ContextPage 执行轻量截图操作。
-        
-        这不是为了保存图片，而是为了触发浏览器的渲染管线，
-        唤醒可能因为后台节流而冻结的页面进程。
-        
-        关键：使用较小的截图区域、较短的超时，避免对正在运行的任务造成影响。
-        """
+        """对指定页面执行轻量截图，触发浏览器渲染管线唤醒"""
         page = cp.page
         if not page or page.is_closed():
             raise RuntimeError("页面已关闭，无法截图")
 
-        # 方法 1：优先尝试截取一个极小区域（最轻量）
         try:
             await page.screenshot(
                 clip={"x": 0, "y": 0, "width": 1, "height": 1},
-                timeout=10000,  # 10 秒超时
+                timeout=10000,
             )
             return
         except Exception:
             pass
 
-        # 方法 2：回退到执行一段 JS 触发渲染
         try:
             await page.evaluate(
                 "() => { document.hidden; window.innerHeight; "
@@ -262,5 +326,4 @@ class KeepaliveService:
         except Exception:
             pass
 
-        # 方法 3：最后尝试完整截图
         await page.screenshot(timeout=15000)
